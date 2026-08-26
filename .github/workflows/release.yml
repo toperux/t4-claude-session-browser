@@ -1,0 +1,188 @@
+name: Release
+
+# Tag a commit `v<version>` and push the tag; this builds a binary for every
+# supported target and publishes them. `workflow_dispatch` builds the same
+# artifacts without releasing, for checking the packaging without burning a
+# version number.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # Resolved once and shared. The tag and Cargo.toml must agree, or the release
+  # is called v0.2.0 and ships a binary that reports 0.1.0 - which also means
+  # `csb update` would offer the "new" release to itself, forever.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          # workflow_dispatch has no tag, so there is nothing to compare against.
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [[ "$tag" != "$crate" ]]; then
+              echo "tag $tag does not match Cargo.toml version $crate" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+            archive: zip
+          # 22.04 rather than latest: the binary links against the builder's
+          # glibc, so the oldest supported runner reaches the most distros.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ''
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ''
+            archive: tar.gz
+          # Intel Macs, cross-compiled from the arm64 runner rather than pinned
+          # to the macos-13 image, which GitHub is retiring. Pure Rust, so this
+          # needs nothing but the extra rustup target.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ''
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Asset names carry the full target triple because that is what
+      # `self_update::get_target()` matches on at update time - see src/update.rs.
+      # The archive is flat (binary at the root) so the updater's default
+      # bin_path_in_archive finds it.
+      - name: Stage the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$out"
+
+          stage=$(mktemp -d)
+          cp "target/${{ matrix.target }}/release/csb${{ matrix.ext }}" "$stage/"
+          cp README.md LICENSE "$stage/"
+
+          name="csb-${{ matrix.target }}"
+          cd "$stage"
+          if [ '${{ matrix.archive }}' = 'zip' ]; then
+            7z a -tzip "$out/$name.zip" ./* >/dev/null
+          else
+            tar czf "$out/$name.tar.gz" ./*
+          fi
+
+          cd "$out"
+          for f in *; do
+            case "$f" in *.sha256) continue ;; esac
+            if command -v sha256sum >/dev/null 2>&1; then
+              hash=$(sha256sum "$f" | cut -d' ' -f1)
+            else
+              hash=$(shasum -a 256 "$f" | cut -d' ' -f1)
+            fi
+            printf '%s  %s' "$hash" "$f" > "$f.sha256"
+            echo "$f  $hash"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: false
+          generate_release_notes: true
+          body: |
+            ### Install
+
+            Download the archive for your platform, unpack it, and put `csb`
+            somewhere on your `PATH`.
+
+            | Platform | Asset |
+            |---|---|
+            | Windows x64 | `csb-x86_64-pc-windows-msvc.zip` |
+            | Linux x64 | `csb-x86_64-unknown-linux-gnu.tar.gz` |
+            | macOS (Apple Silicon) | `csb-aarch64-apple-darwin.tar.gz` |
+            | macOS (Intel) | `csb-x86_64-apple-darwin.tar.gz` |
+
+            Not code-signed. Windows SmartScreen shows "Windows protected your
+            PC" the first few times (**More info** -> **Run anyway**); on macOS
+            run `xattr -d com.apple.quarantine ./csb` after unpacking.
+
+            ### Updating
+
+            ```sh
+            csb update --check   # is there a newer one?
+            csb update           # install it
+            ```
+
+            The desktop GUI also checks once a day on launch and offers the
+            update in a dismissible banner; it never installs on its own. Set
+            `CSB_NO_UPDATE_CHECK=1` to turn checking off entirely.
+
+            Updating replaces the running executable in place, so `csb` needs
+            write access to its own directory - a copy under `C:\Program Files`
+            or `/usr/local/bin` will need elevation.
+
+            ### Verifying a download
+
+            Every asset ships a `.sha256` sidecar. Check one with `sha256sum -c`
+            on Linux, `shasum -a 256 -c` on macOS, or on Windows:
+
+            ```powershell
+            Get-FileHash '.\<file>' -Algorithm SHA256
+            ```
