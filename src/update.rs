@@ -4,7 +4,7 @@
 //! which is what `self_update` matches on by default, so no `.target()` override
 //! is needed here - the release workflow and this module agree by construction.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -25,37 +25,98 @@ pub fn checks_disabled() -> bool {
     std::env::var_os("CSB_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-fn updater(progress: bool) -> Result<self_update::backends::github::Update> {
-    let update = self_update::backends::github::Update::configure()
+/// Binaries that a release ships and an update therefore has to replace.
+/// Windows carries a second, GUI-subsystem executable for the Start Menu
+/// shortcut; every other platform ships one binary.
+const BINARIES: &[&str] = if cfg!(windows) {
+    &["csb", "csb-gui"]
+} else {
+    &["csb"]
+};
+
+/// `stem` is the binary's name without any platform suffix. `install_path` aims
+/// the replacement at one specific file rather than at whatever happens to be
+/// running - with two binaries, "the current exe" is the wrong target for one of
+/// them.
+fn updater(
+    stem: &str,
+    install_path: Option<&std::path::Path>,
+    progress: bool,
+) -> Result<self_update::backends::github::Update> {
+    let mut builder = self_update::backends::github::Update::configure();
+    builder
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         // Looked up *inside* the archive, so it needs the platform suffix:
         // plain "csb" would never match "csb.exe".
-        .bin_name(format!("csb{}", std::env::consts::EXE_SUFFIX))
+        .bin_name(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
         .current_version(CURRENT)
         .show_download_progress(progress)
         .show_output(progress)
         // Without this `update()` blocks on a stdin prompt, which would hang the GUI.
-        .no_confirm(true)
-        .build()?;
-    Ok(update)
+        .no_confirm(true);
+    if let Some(path) = install_path {
+        builder.bin_install_path(path);
+    }
+    Ok(builder.build()?)
 }
 
 /// Ask GitHub whether a newer release exists. Blocking - never call from the UI thread.
 pub fn check() -> Result<Option<Available>> {
-    let found = updater(false)?.is_update_available()?;
+    let found = updater("csb", None, false)?.is_update_available()?;
     Ok(found.map(|r| Available {
         version: r.version().to_string(),
     }))
 }
 
-/// Download the asset for this target and replace the running executable.
+/// Download the release and replace every binary this platform ships.
 ///
-/// `self_update` stages its temp files in the running executable's own directory,
-/// so this fails when the binary lives somewhere unwritable (`C:\Program Files`,
+/// `self_update` stages its temp files in the target's own directory, so this
+/// fails when the binaries live somewhere unwritable (`C:\Program Files`,
 /// `/usr/local/bin` without sudo). The error says so; it is not worth retrying.
+///
+/// On Windows both `csb.exe` and `csb-gui.exe` are replaced. Updating only one
+/// would leave the other reporting the old version - and since the GUI is what
+/// shows the update banner, a stale `csb-gui.exe` would offer the same update
+/// forever.
 pub fn install(progress: bool) -> Result<self_update::VersionStatus> {
-    Ok(updater(progress)?.update()?)
+    let exe = std::env::current_exe().context("cannot locate the running executable")?;
+    let dir = exe
+        .parent()
+        .context("running executable has no parent directory")?;
+
+    let mut status = None;
+    for (i, stem) in BINARIES.iter().enumerate() {
+        let path = dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
+        let outcome = updater(stem, Some(&path), progress).and_then(|u| Ok(u.update()?));
+
+        match outcome {
+            Ok(done) => status.get_or_insert(done),
+            Err(e) => {
+                // `self_update` self-replaces the *running* binary but plainly
+                // moves over any other, and Windows refuses to overwrite an exe
+                // that some other process still has open. Name the file and the
+                // fix rather than surfacing a bare permission error.
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let hint = if cfg!(windows) {
+                    format!("{name} could not be replaced - close it and run the update again")
+                } else {
+                    format!("{name} could not be replaced")
+                };
+                return Err(match i {
+                    // A later binary failing means the earlier ones already
+                    // landed: say so, or "failed" reads as "nothing changed".
+                    n if n > 0 => e.context(format!(
+                        "{hint}. The update is half-applied: {} already updated",
+                        BINARIES[..i].join(", ")
+                    )),
+                    _ => e.context(hint),
+                });
+            }
+        };
+    }
+
+    status.context("no binaries were configured to update")
 }
 
 /// `check()` behind a 24h throttle and the `CSB_NO_UPDATE_CHECK` opt-out.

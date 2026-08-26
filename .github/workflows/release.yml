@@ -100,10 +100,16 @@ jobs:
         run: |
           set -euo pipefail
           out="$GITHUB_WORKSPACE/dist"
-          mkdir -p "$out"
+          stage="$GITHUB_WORKSPACE/stage"
+          mkdir -p "$out" "$stage"
 
-          stage=$(mktemp -d)
           cp "target/${{ matrix.target }}/release/csb${{ matrix.ext }}" "$stage/"
+          # Windows ships a second, GUI-subsystem binary so the installer's Start
+          # Menu shortcut can open the app without a console window behind it.
+          # The updater expects it in the archive too - see BINARIES in update.rs.
+          if [ '${{ runner.os }}' = 'Windows' ]; then
+            cp "target/${{ matrix.target }}/release/csb-gui.exe" "$stage/"
+          fi
           cp README.md LICENSE "$stage/"
 
           name="csb-${{ matrix.target }}"
@@ -114,8 +120,38 @@ jobs:
             tar czf "$out/$name.tar.gz" ./*
           fi
 
-          cd "$out"
+      # The installer is named csb-setup-<version>-x64.exe on purpose: it must
+      # contain neither the target triple nor both "x86_64" and "windows", or
+      # the updater would match it ahead of the .zip in GitHub's name-sorted
+      # asset list and download an installer where it expects an archive.
+      - name: Build the Windows installer
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not on the image; installing it"
+            choco install innosetup -y --no-progress | Out-Null
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+
+          & $iscc "/DVersion=$env:VERSION" `
+                  "/DStageDir=$env:GITHUB_WORKSPACE\stage" `
+                  "/DIconFile=$env:GITHUB_WORKSPACE\assets\csb.ico" `
+                  "/DOutDir=$env:GITHUB_WORKSPACE\dist" `
+                  "$env:GITHUB_WORKSPACE\installer\csb.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+      # Separate from staging so the installer, built above, gets a sidecar too.
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist"
           for f in *; do
+            [ -f "$f" ] || continue
             case "$f" in *.sha256) continue ;; esac
             if command -v sha256sum >/dev/null 2>&1; then
               hash=$(sha256sum "$f" | cut -d' ' -f1)
@@ -149,15 +185,25 @@ jobs:
           body: |
             ### Install
 
-            Download the archive for your platform, unpack it, and put `csb`
-            somewhere on your `PATH`.
+            **Windows:** run `csb-setup-${{ needs.version.outputs.version }}-x64.exe`.
+            It installs for the current user only (no admin prompt), adds `csb`
+            to your `PATH`, and puts the desktop app in the Start Menu. Open a
+            **new** terminal afterwards for `PATH` to take effect.
+
+            Otherwise download the archive for your platform, unpack it, and put
+            `csb` somewhere on your `PATH`.
 
             | Platform | Asset |
             |---|---|
-            | Windows x64 | `csb-x86_64-pc-windows-msvc.zip` |
+            | Windows x64 (installer) | `csb-setup-${{ needs.version.outputs.version }}-x64.exe` |
+            | Windows x64 (portable) | `csb-x86_64-pc-windows-msvc.zip` |
             | Linux x64 | `csb-x86_64-unknown-linux-gnu.tar.gz` |
             | macOS (Apple Silicon) | `csb-aarch64-apple-darwin.tar.gz` |
             | macOS (Intel) | `csb-x86_64-apple-darwin.tar.gz` |
+
+            The Windows downloads contain two executables: `csb.exe` for the
+            terminal, and `csb-gui.exe` for the desktop app — the latter opens
+            without a console window behind it.
 
             Not code-signed. Windows SmartScreen shows "Windows protected your
             PC" the first few times (**More info** -> **Run anyway**); on macOS
@@ -174,9 +220,14 @@ jobs:
             update in a dismissible banner; it never installs on its own. Set
             `CSB_NO_UPDATE_CHECK=1` to turn checking off entirely.
 
-            Updating replaces the running executable in place, so `csb` needs
-            write access to its own directory - a copy under `C:\Program Files`
-            or `/usr/local/bin` will need elevation.
+            Updating replaces the executables in place, so `csb` needs write
+            access to its own directory - a copy under `C:\Program Files` or
+            `/usr/local/bin` will need elevation. The Windows installer puts
+            everything under `%LOCALAPPDATA%`, so updates there just work.
+
+            On Windows the update replaces both `csb.exe` and `csb-gui.exe`;
+            close the desktop app first if it is open, since Windows will not
+            let a running executable be overwritten.
 
             ### Verifying a download
 

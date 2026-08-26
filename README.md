@@ -7,8 +7,13 @@ a desktop GUI, a terminal UI, and scriptable subcommands.
 
 ## Install
 
-Grab the archive for your platform from the [latest release][releases], unpack it,
-and put `csb` on your `PATH`. Every asset has a `.sha256` sidecar next to it.
+**Windows** — run `csb-setup-<version>-x64.exe` from the [latest release][releases].
+It installs for the current user only, so there is no admin prompt; it adds `csb`
+to your `PATH` and puts the desktop app in the Start Menu. Open a **new** terminal
+afterwards, or `PATH` won't have caught up.
+
+**Anything else** — grab the archive for your platform from the same place, unpack
+it, and put `csb` on your `PATH`. Every asset has a `.sha256` sidecar next to it.
 
 [releases]: https://github.com/toperux/t4-claude-session-browser/releases/latest
 
@@ -17,6 +22,10 @@ Or build it:
 ```sh
 cargo build --release      # target/release/csb
 ```
+
+On Windows the release also carries `csb-gui.exe`. It is the same app as `csb`
+with no arguments, built as a GUI binary so a shortcut to it opens the window
+without a console sitting behind it; `csb.exe` stays the one to use in a terminal.
 
 ## Use
 
@@ -64,14 +73,21 @@ CLI refuses without `--force`.
 ## Updating
 
 `csb update` downloads the release built for your platform and replaces the
-running executable in place, so `csb` needs write access to its own directory —
-a copy in `C:\Program Files` or `/usr/local/bin` will need elevation. Nothing
-restarts on its own; the new version applies next launch.
+executables in place, so `csb` needs write access to its own directory — a copy
+in `C:\Program Files` or `/usr/local/bin` will need elevation, whereas the
+Windows installer's `%LOCALAPPDATA%` location just works. On Windows both
+`csb.exe` and `csb-gui.exe` are replaced, so close the desktop app first —
+Windows won't overwrite a running executable, and the update will say so if it
+hits one. Nothing restarts on its own; the new version applies next launch.
 
 The GUI additionally checks once a day on startup and, if there is something
 newer, shows a dismissible banner with an **Update** button. A failed check is
 silent — offline looks the same as up to date. Set `CSB_NO_UPDATE_CHECK=1` to
 disable checking entirely, including `csb update --check`.
+
+One cosmetic wart if you used the installer: a self-update swaps the binaries but
+doesn't touch the uninstall registry entry, so Add/Remove Programs keeps showing
+the version you installed. Running the new installer resyncs it.
 
 ## Notes
 

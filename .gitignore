@@ -1,4 +1,6 @@
 /target
+/dist
+/stage
 *.pdb
 .DS_Store
 Thumbs.db

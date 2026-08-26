@@ -1,6 +1,6 @@
 [package]
 name = "claude-session-browser"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Browse, preview and delete Claude Code sessions - GUI, TUI and CLI in one binary"
 license = "MIT"
@@ -40,6 +40,11 @@ trash = "5"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Embeds assets/csb.ico as the exe resource, so Explorer, the taskbar and the
+# installer's Start Menu shortcut all get the real icon.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 2

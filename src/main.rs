@@ -1,18 +1,10 @@
-mod cli;
-mod del;
-mod gui;
-mod index;
-mod paths;
-mod transcript;
-mod tui;
-mod update;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use index::Index;
-use paths::ClaudeDir;
+use claude_session_browser::index::Index;
+use claude_session_browser::paths::ClaudeDir;
+use claude_session_browser::{cli, gui, tui};
 
 /// Browse, preview and delete Claude Code sessions.
 #[derive(Parser)]
