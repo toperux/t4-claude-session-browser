@@ -312,7 +312,7 @@ impl App {
                             .color(ROLE_USER),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button("Dismiss").clicked() {
                             self.installed = None;
                         }
                     });
@@ -338,7 +338,7 @@ impl App {
                     self.install_rx = Some(spawn_install(ctx.clone()));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("Dismiss").clicked() {
                         self.update_banner = None;
                     }
                 });

@@ -18,7 +18,6 @@ const CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// A release newer than the running binary.
 pub struct Available {
     pub version: String,
-    pub body: String,
 }
 
 /// True when the user has opted out of update checks entirely.
@@ -47,7 +46,6 @@ pub fn check() -> Result<Option<Available>> {
     let found = updater(false)?.is_update_available()?;
     Ok(found.map(|r| Available {
         version: r.version().to_string(),
-        body: r.body().unwrap_or_default().to_string(),
     }))
 }
 
@@ -75,10 +73,7 @@ pub fn check_throttled() -> Result<Option<Available>> {
         return Ok(cache
             .last_seen
             .filter(|v| is_newer(v))
-            .map(|version| Available {
-                version,
-                body: String::new(),
-            }));
+            .map(|version| Available { version }));
     }
 
     let found = check()?;

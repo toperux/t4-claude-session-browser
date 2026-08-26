@@ -321,9 +321,12 @@ pub fn update(check_only: bool) -> Result<()> {
             found.version,
             crate::update::CURRENT
         );
-        if !found.body.trim().is_empty() {
-            println!("\n{}", found.body.trim());
-        }
+        println!(
+            "https://github.com/{}/{}/releases/tag/v{}",
+            crate::update::REPO_OWNER,
+            crate::update::REPO_NAME,
+            found.version
+        );
         println!("\nrun `csb update` to install it");
         return Ok(());
     }
