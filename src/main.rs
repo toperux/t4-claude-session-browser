@@ -72,6 +72,10 @@ enum Cmd {
         /// Only report whether an update exists
         #[arg(long)]
         check: bool,
+        /// Reinstall the latest release even if this binary looks current.
+        /// Use this to finish an update that was left half-applied.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -90,8 +94,8 @@ fn main() -> Result<()> {
 
     // `update` must work on a machine with no ~/.claude at all, so the directory
     // is resolved per-command rather than up front.
-    if let Some(Cmd::Update { check }) = args.cmd {
-        return cli::update(check);
+    if let Some(Cmd::Update { check, force }) = args.cmd {
+        return cli::update(check, force);
     }
     let dir = ClaudeDir::resolve(args.claude_dir.as_deref())?;
 

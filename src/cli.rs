@@ -302,10 +302,21 @@ pub fn parse_duration(spec: &str) -> Result<Duration> {
     Ok(d)
 }
 
-/// `csb update` / `csb update --check`.
-pub fn update(check_only: bool) -> Result<()> {
+/// `csb update` / `csb update --check` / `csb update --force`.
+pub fn update(check_only: bool, force: bool) -> Result<()> {
     if crate::update::checks_disabled() {
         println!("update checks are disabled (CSB_NO_UPDATE_CHECK is set)");
+        return Ok(());
+    }
+
+    // --force reinstalls whatever the latest release holds, without asking
+    // whether this binary looks current. That is the way out of a half-applied
+    // update: the running binary can be up to date while a sibling it ships
+    // with is not, and nothing else would notice.
+    if force && !check_only {
+        println!("reinstalling the latest release");
+        let status = crate::update::install(true, true)?;
+        println!("installed csb {} - restart csb to use it", status.version());
         return Ok(());
     }
 
@@ -336,7 +347,7 @@ pub fn update(check_only: bool) -> Result<()> {
         crate::update::CURRENT,
         found.version
     );
-    let status = crate::update::install(true)?;
+    let status = crate::update::install(true, false)?;
     if status.is_updated() {
         println!("installed csb {} - restart csb to use it", status.version());
     } else {

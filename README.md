@@ -36,7 +36,7 @@ csb projects               # list projects
 csb list [-p <project>] [--sort date|size|msgs] [--json]
 csb show <id> [--raw] [--sidechains]
 csb delete <id>... [--older-than 30d] [-p <project>] [--dry-run] [-y] [--force]
-csb update [--check]       # install the latest release
+csb update [--check] [--force]   # install the latest release
 ```
 
 `<id>` accepts any unique prefix of a session UUID. `--claude-dir <DIR>` points the
@@ -79,6 +79,11 @@ Windows installer's `%LOCALAPPDATA%` location just works. On Windows both
 `csb.exe` and `csb-gui.exe` are replaced, so close the desktop app first —
 Windows won't overwrite a running executable, and the update will say so if it
 hits one. Nothing restarts on its own; the new version applies next launch.
+
+If an update does get interrupted that way, `csb update` will then report
+itself up to date while the other binary is still behind, because each check
+compares against the running binary's own version. `csb update --force`
+reinstalls the latest release regardless and is the way out of that.
 
 The GUI additionally checks once a day on startup and, if there is something
 newer, shows a dismissible banner with an **Update** button. A failed check is

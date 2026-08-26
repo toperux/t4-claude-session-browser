@@ -60,7 +60,7 @@ fn spawn_install(ctx: egui::Context) -> Receiver<Result<String, String>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         // No progress bar: there is no console attached to a GUI launch.
-        let result = crate::update::install(false)
+        let result = crate::update::install(false, false)
             .map(|s| s.version().to_string())
             .map_err(|e| e.to_string());
         let _ = tx.send(result);

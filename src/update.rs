@@ -42,6 +42,7 @@ fn updater(
     stem: &str,
     install_path: Option<&std::path::Path>,
     progress: bool,
+    force: bool,
 ) -> Result<self_update::backends::github::Update> {
     let mut builder = self_update::backends::github::Update::configure();
     builder
@@ -50,7 +51,13 @@ fn updater(
         // Looked up *inside* the archive, so it needs the platform suffix:
         // plain "csb" would never match "csb.exe".
         .bin_name(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
-        .current_version(CURRENT)
+        // Every pass compares against the *running* binary's version, not the
+        // version of the file it is about to overwrite - there is no cheap way
+        // to read the latter. So after a half-applied update (see `install`),
+        // the stale sibling looks current and nothing would repair it. Forcing
+        // a floor version makes every pass install unconditionally, which is
+        // what `csb update --force` is for.
+        .current_version(if force { "0.0.0" } else { CURRENT })
         .show_download_progress(progress)
         .show_output(progress)
         // Without this `update()` blocks on a stdin prompt, which would hang the GUI.
@@ -63,7 +70,7 @@ fn updater(
 
 /// Ask GitHub whether a newer release exists. Blocking - never call from the UI thread.
 pub fn check() -> Result<Option<Available>> {
-    let found = updater("csb", None, false)?.is_update_available()?;
+    let found = updater("csb", None, false, false)?.is_update_available()?;
     Ok(found.map(|r| Available {
         version: r.version().to_string(),
     }))
@@ -79,7 +86,7 @@ pub fn check() -> Result<Option<Available>> {
 /// would leave the other reporting the old version - and since the GUI is what
 /// shows the update banner, a stale `csb-gui.exe` would offer the same update
 /// forever.
-pub fn install(progress: bool) -> Result<self_update::VersionStatus> {
+pub fn install(progress: bool, force: bool) -> Result<self_update::VersionStatus> {
     let exe = std::env::current_exe().context("cannot locate the running executable")?;
     let dir = exe
         .parent()
@@ -88,7 +95,7 @@ pub fn install(progress: bool) -> Result<self_update::VersionStatus> {
     let mut status = None;
     for (i, stem) in BINARIES.iter().enumerate() {
         let path = dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
-        let outcome = updater(stem, Some(&path), progress).and_then(|u| Ok(u.update()?));
+        let outcome = updater(stem, Some(&path), progress, force).and_then(|u| Ok(u.update()?));
 
         match outcome {
             Ok(done) => status.get_or_insert(done),
@@ -99,7 +106,9 @@ pub fn install(progress: bool) -> Result<self_update::VersionStatus> {
                 // fix rather than surfacing a bare permission error.
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 let hint = if cfg!(windows) {
-                    format!("{name} could not be replaced - close it and run the update again")
+                    format!(
+                        "{name} could not be replaced - close it, then run `csb update --force`"
+                    )
                 } else {
                     format!("{name} could not be replaced")
                 };
