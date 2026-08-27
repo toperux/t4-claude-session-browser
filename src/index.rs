@@ -45,9 +45,14 @@ impl SessionMeta {
     }
 
     /// Last real activity: the newest record timestamp, else the file mtime.
+    /// An mtime outside chrono's range (a bad clock, a mangled archive) sorts
+    /// to the epoch rather than taking the whole index down with it.
     pub fn activity(&self) -> DateTime<Utc> {
-        self.last_ts
-            .unwrap_or_else(|| Utc.timestamp_millis_opt(self.modified_ms).unwrap())
+        self.last_ts.unwrap_or_else(|| {
+            Utc.timestamp_millis_opt(self.modified_ms)
+                .single()
+                .unwrap_or(DateTime::UNIX_EPOCH)
+        })
     }
 
     /// Likely a live session someone is using right now.
@@ -294,7 +299,7 @@ fn scan_file(slug: &str, path: &Path, size_bytes: u64, modified_ms: i64) -> Resu
         if user_msgs + assistant_msgs == 0 {
             "(empty session)".to_string()
         } else {
-            format!("(untitled {})", &id[..id.len().min(8)])
+            format!("(untitled {})", short_id(&id))
         }
     });
 
@@ -595,6 +600,41 @@ mod tests {
         // Truncating on a char boundary, not a byte one.
         assert_eq!(short_id("日本語テストです"), "日本語テストです");
         assert_eq!(short_id("日本語テストですね"), "日本語テストです");
+    }
+
+    /// The untitled fallback puts the file stem in the title. Stems are not
+    /// validated UUIDs, so slicing one by bytes would panic mid-codepoint - and
+    /// this runs inside `Index::build`, which would take the GUI down silently.
+    #[test]
+    fn untitled_fallback_survives_a_non_ascii_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("セッション記録.jsonl");
+        std::fs::write(&path, br#"{"type":"user","message":{"content":""}}"#).unwrap();
+
+        let meta = scan_file("slug", &path, 40, 0).unwrap();
+        assert_eq!(meta.title, "(untitled セッション記録)");
+    }
+
+    /// A file whose mtime is far outside chrono's range must not panic the
+    /// whole index; it just sorts to the epoch.
+    #[test]
+    fn absurd_mtime_does_not_panic() {
+        let meta = SessionMeta {
+            id: "x".into(),
+            path: PathBuf::new(),
+            project_slug: "s".into(),
+            size_bytes: 0,
+            modified_ms: i64::MAX,
+            first_ts: None,
+            last_ts: None,
+            title: String::new(),
+            cwd: None,
+            git_branch: None,
+            user_msgs: 0,
+            assistant_msgs: 0,
+            tool_calls: 0,
+        };
+        assert_eq!(meta.activity(), DateTime::UNIX_EPOCH);
     }
 
     #[test]

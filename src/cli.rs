@@ -292,14 +292,16 @@ pub fn parse_duration(spec: &str) -> Result<Duration> {
     let n: i64 = num
         .parse()
         .with_context(|| format!("bad duration '{spec}', expected e.g. 30d"))?;
+    // try_* rather than the plain constructors: those panic on overflow, and
+    // the number here comes straight from the command line.
     let d = match unit {
-        "m" => Duration::minutes(n),
-        "h" => Duration::hours(n),
-        "d" | "" => Duration::days(n),
-        "w" => Duration::weeks(n),
+        "m" => Duration::try_minutes(n),
+        "h" => Duration::try_hours(n),
+        "d" | "" => Duration::try_days(n),
+        "w" => Duration::try_weeks(n),
         other => bail!("unknown duration unit '{other}', use m/h/d/w"),
     };
-    Ok(d)
+    d.with_context(|| format!("duration '{spec}' is out of range"))
 }
 
 /// `csb update` / `csb update --check` / `csb update --force`.
@@ -368,5 +370,9 @@ mod tests {
         assert_eq!(parse_duration("7").unwrap(), Duration::days(7));
         assert!(parse_duration("7y").is_err());
         assert!(parse_duration("soon").is_err());
+        // Overflow is an error, not a panic: chrono's Duration::weeks aborts on
+        // anything this large.
+        assert!(parse_duration("9223372036854775807w").is_err());
+        assert!(parse_duration("9223372036854775807d").is_err());
     }
 }
