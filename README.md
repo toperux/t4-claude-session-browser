@@ -86,8 +86,10 @@ compares against the running binary's own version. `csb update --force`
 reinstalls the latest release regardless and is the way out of that.
 
 The GUI additionally checks once a day on startup and, if there is something
-newer, shows a dismissible banner with an **Update** button. A failed check is
-silent — offline looks the same as up to date. Set `CSB_NO_UPDATE_CHECK=1` to
+newer, shows a dismissible banner with an **Update** button. **Check for updates**
+in the settings window (⚙ at the right of the toolbar, which also shows the
+installed version) runs the check immediately, ignoring the daily throttle. A
+failed check is silent — offline looks the same as up to date. Set `CSB_NO_UPDATE_CHECK=1` to
 disable checking entirely, including `csb update --check`; an explicit `csb update`
 still installs.
 

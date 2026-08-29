@@ -153,11 +153,19 @@ pub fn check_throttled() -> Result<Option<Available>> {
             .map(|version| Available { version }));
     }
 
+    check_now()
+}
+
+/// `check()` ignoring the throttle, but still recording the result so the
+/// 24h window restarts here and later launches replay this answer. This is
+/// what the GUI's "Check for updates" button calls; it does not consult
+/// `CSB_NO_UPDATE_CHECK` - an explicit click is the caller's decision.
+pub fn check_now() -> Result<Option<Available>> {
     // The throttle advances on failure too: "once a day" means once a day,
     // not once per launch while offline.
     let found = check();
     CheckCache {
-        last_check_secs: now,
+        last_check_secs: chrono::Utc::now().timestamp(),
         last_seen: found
             .as_ref()
             .ok()

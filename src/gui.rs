@@ -47,15 +47,28 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Ask GitHub for a newer release without blocking startup. Errors collapse to
-/// `None` - a failed check must be indistinguishable from "up to date".
-fn spawn_update_check(ctx: egui::Context) -> Receiver<Option<Available>> {
+/// Ask GitHub for a newer release off the UI thread. The startup check is
+/// throttled and its errors collapse to `None` - a failed check must be
+/// indistinguishable from "up to date". A `manual` check (the settings window)
+/// ignores the throttle and reports failure, because the user asked.
+fn spawn_update_check(ctx: egui::Context, manual: bool) -> UpdateCheck {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let _ = tx.send(crate::update::check_throttled().unwrap_or(None));
+        let result = if manual {
+            crate::update::check_now().map_err(|e| e.to_string())
+        } else {
+            Ok(crate::update::check_throttled().unwrap_or(None))
+        };
+        let _ = tx.send(result);
         ctx.request_repaint();
     });
-    rx
+    UpdateCheck { rx, manual }
+}
+
+/// An update check in flight.
+struct UpdateCheck {
+    rx: Receiver<Result<Option<Available>, String>>,
+    manual: bool,
 }
 
 /// Download and swap the executable. Sends the installed version, or the error.
@@ -118,9 +131,12 @@ struct App {
 
     confirm: Option<Vec<DeletePlan>>,
     status: String,
+    settings_open: bool,
+    /// Outcome of the last manual update check, shown in the settings window.
+    update_note: String,
 
-    /// Startup update check, running off the UI thread.
-    update_rx: Option<Receiver<Option<Available>>>,
+    /// The startup check, or a manual one, running off the UI thread.
+    update_check: Option<UpdateCheck>,
     update_started: bool,
     /// A newer release, once one is known. `None` keeps the banner hidden.
     update_banner: Option<Available>,
@@ -152,9 +168,11 @@ impl App {
             preview_shown: PAGE,
             confirm: None,
             status: String::new(),
+            settings_open: false,
+            update_note: String::new(),
             // Spawned on the first frame instead of here: the worker needs an
             // egui Context to request a repaint when its result lands.
-            update_rx: None,
+            update_check: None,
             update_started: false,
             update_banner: None,
             install_rx: None,
@@ -281,17 +299,34 @@ impl App {
 
         if !self.update_started {
             self.update_started = true;
-            self.update_rx = Some(spawn_update_check(ctx.clone()));
+            self.update_check = Some(spawn_update_check(ctx.clone(), false));
         }
 
-        if let Some(rx) = &self.update_rx {
-            match rx.try_recv() {
-                Ok(found) => {
-                    self.update_banner = found;
-                    self.update_rx = None;
+        let landed = self
+            .update_check
+            .as_ref()
+            .and_then(|c| match c.rx.try_recv() {
+                Ok(result) => Some((c.manual, result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some((c.manual, Err("update checker stopped".to_string())))
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => self.update_rx = None,
+            });
+        if let Some((manual, result)) = landed {
+            self.update_check = None;
+            match result {
+                Ok(found) => {
+                    if manual {
+                        self.update_note = match &found {
+                            Some(a) => format!("csb {} is available", a.version),
+                            None => format!("csb {} is up to date", crate::update::CURRENT),
+                        };
+                    }
+                    // `None` also clears a stale banner, e.g. after a CLI update.
+                    self.update_banner = found;
+                }
+                Err(e) if manual => self.update_note = format!("update check failed: {e}"),
+                Err(_) => {}
             }
         }
 
@@ -320,46 +355,65 @@ impl App {
         if self.update_banner.is_none() && self.installed.is_none() && self.install_rx.is_none() {
             return;
         }
-        egui::TopBottomPanel::top("update").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(version) = &self.installed {
+        // Tinted and padded so it reads as a notice, not another toolbar row:
+        // amber while an update is on offer, green once it has landed.
+        // The green is muted further than the amber: a success notice should
+        // sit back, an offer should stand out.
+        let fill = if self.installed.is_some() {
+            ROLE_USER.gamma_multiply(0.10)
+        } else {
+            ROLE_TOOL.gamma_multiply(0.18)
+        };
+        let frame = egui::Frame::default()
+            .fill(fill)
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0));
+        egui::TopBottomPanel::top("update")
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    if let Some(version) = &self.installed {
+                        ui.label(
+                            RichText::new(format!(
+                                "✔ csb {version} installed — restart csb to use it"
+                            ))
+                            .color(ROLE_USER)
+                            .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Dismiss").clicked() {
+                                self.installed = None;
+                            }
+                        });
+                        return;
+                    }
+                    if self.install_rx.is_some() {
+                        ui.add(egui::Spinner::new());
+                        ui.label("downloading update…");
+                        return;
+                    }
+                    let Some(found) = &self.update_banner else {
+                        return;
+                    };
                     ui.label(
-                        RichText::new(format!("csb {version} installed - restart csb to use it"))
-                            .color(ROLE_USER),
+                        RichText::new(format!("⬆ csb {} is available", found.version))
+                            .color(ROLE_TOOL)
+                            .strong(),
                     );
+                    ui.label(RichText::new(format!("you have {}", crate::update::CURRENT)).weak());
+                    let update =
+                        egui::Button::new(RichText::new("Update").strong().color(Color32::BLACK))
+                            .fill(ROLE_TOOL);
+                    if ui.add(update).clicked() {
+                        self.install_rx = Some(spawn_install(ctx.clone()));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Dismiss").clicked() {
-                            self.installed = None;
+                            self.update_banner = None;
                         }
                     });
-                    return;
-                }
-                if self.install_rx.is_some() {
-                    ui.add(egui::Spinner::new());
-                    ui.label("downloading update…");
-                    return;
-                }
-                let Some(found) = &self.update_banner else {
-                    return;
-                };
-                ui.label(
-                    RichText::new(format!(
-                        "csb {} is available (you have {})",
-                        found.version,
-                        crate::update::CURRENT
-                    ))
-                    .color(ROLE_TOOL),
-                );
-                if ui.button("Update").clicked() {
-                    self.install_rx = Some(spawn_install(ctx.clone()));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Dismiss").clicked() {
-                        self.update_banner = None;
-                    }
                 });
             });
-        });
     }
 
     fn focused_meta(&self) -> Option<&SessionMeta> {
@@ -464,6 +518,9 @@ impl eframe::App for App {
             .show(ctx, |ui| self.sessions_pane(ui, ctx));
         egui::CentralPanel::default().show(ctx, |ui| self.preview_pane(ui));
 
+        if self.settings_open {
+            self.settings_window(ctx);
+        }
         if let Some(plans) = self.confirm.take() {
             self.confirm_modal(ctx, plans);
         }
@@ -522,10 +579,85 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("⚙").on_hover_text("Settings").clicked() {
+                    self.settings_open = !self.settings_open;
+                }
                 ui.label(RichText::new(&self.status).color(ROLE_USER));
             });
         });
         ui.add_space(4.0);
+    }
+
+    /// Version and the manual update check. Non-modal: closing it does not
+    /// cancel a check in flight, the result just waits here.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.set_min_width(440.0);
+                ui.add_space(4.0);
+
+                ui.label(RichText::new("ABOUT").small().weak());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Claude Session Browser").strong());
+                    ui.label(RichText::new(format!("v{}", crate::update::CURRENT)).weak());
+                });
+                let repo = format!(
+                    "github.com/{}/{}",
+                    crate::update::REPO_OWNER,
+                    crate::update::REPO_NAME
+                );
+                ui.hyperlink_to(&repo, format!("https://{repo}"));
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.label(RichText::new("UPDATES").small().weak());
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "csb looks for a new release once a day at startup. \
+                         Checking here asks GitHub right now.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    // Disabled while any check is in flight, the startup one included.
+                    if ui
+                        .add_enabled(
+                            self.update_check.is_none(),
+                            egui::Button::new("Check for updates"),
+                        )
+                        .clicked()
+                    {
+                        if crate::update::checks_disabled() {
+                            self.update_note =
+                                "update checks are disabled (CSB_NO_UPDATE_CHECK is set)".into();
+                        } else {
+                            self.update_note = "checking…".into();
+                            self.update_check = Some(spawn_update_check(ctx.clone(), true));
+                        }
+                    }
+                    // Any check, so the disabled button right after launch is
+                    // explained too.
+                    if self.update_check.is_some() {
+                        ui.spinner();
+                    }
+                });
+                if !self.update_note.is_empty() {
+                    ui.label(RichText::new(&self.update_note).weak());
+                }
+                ui.add_space(8.0);
+            });
+        self.settings_open = open;
     }
 
     fn projects_pane(&mut self, ui: &mut egui::Ui) {
