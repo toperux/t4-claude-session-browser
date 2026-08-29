@@ -13,7 +13,7 @@ to your `PATH` and puts the desktop app in the Start Menu. Open a **new** termin
 afterwards, or `PATH` won't have caught up.
 
 **Anything else** — grab the archive for your platform from the same place, unpack
-it, and put `csb` on your `PATH`. Every asset has a `.sha256` sidecar next to it.
+it, and put `csb` on your `PATH`. `SHA256SUMS` alongside the assets lists their hashes.
 
 [releases]: https://github.com/toperux/t4-claude-session-browser/releases/latest
 
@@ -46,7 +46,7 @@ defaults to `~/.claude`.
 ### TUI keys
 
 `tab` cycle panes · `j/k` move · `g/G` top/bottom · `space` mark · `a`/`A` mark all/none
-`d` delete · `/` filter · `s` cycle sort · `r` reload · `q` quit
+`d` delete · `/` filter · `s` cycle sort · `r` reload · `q`/`ctrl-c` quit
 
 ### GUI
 
@@ -88,7 +88,8 @@ reinstalls the latest release regardless and is the way out of that.
 The GUI additionally checks once a day on startup and, if there is something
 newer, shows a dismissible banner with an **Update** button. A failed check is
 silent — offline looks the same as up to date. Set `CSB_NO_UPDATE_CHECK=1` to
-disable checking entirely, including `csb update --check`.
+disable checking entirely, including `csb update --check`; an explicit `csb update`
+still installs.
 
 One cosmetic wart if you used the installer: a self-update swaps the binaries but
 doesn't touch the uninstall registry entry, so Add/Remove Programs keeps showing

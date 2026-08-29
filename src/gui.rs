@@ -20,6 +20,9 @@ const ROLE_ERROR: Color32 = Color32::from_rgb(0xe0, 0x6c, 0x6c);
 /// How many transcript entries are drawn before the "show more" button.
 const PAGE: usize = 300;
 
+/// Vertical padding inside a session row; part of the fixed row height.
+const ROW_MARGIN_Y: f32 = 5.0;
+
 #[derive(PartialEq, Clone, Copy)]
 enum Sort {
     Date,
@@ -105,6 +108,9 @@ struct App {
 
     pending: Option<PendingPreview>,
     preview: Option<(String, Transcript)>,
+    /// Lower-cased searchable text per preview entry, built once on load so
+    /// the find box does not re-lowercase the whole transcript every frame.
+    preview_lower: Vec<String>,
     /// Why the current selection has no transcript, if it failed.
     preview_error: Option<String>,
     preview_search: String,
@@ -140,6 +146,7 @@ impl App {
             anchor: None,
             pending: None,
             preview: None,
+            preview_lower: Vec::new(),
             preview_error: None,
             preview_search: String::new(),
             preview_shown: PAGE,
@@ -215,7 +222,9 @@ impl App {
         self.preview_error = None;
         self.preview_shown = PAGE;
 
-        let Ok(meta) = self.index.find(id) else {
+        // Exact match, not `Index::find`: that is a prefix lookup, and an id
+        // that happens to prefix another would refuse to load at all.
+        let Some(meta) = self.index.sessions.iter().find(|s| s.id == id) else {
             self.preview_error = Some(format!("session {id} is no longer in the index"));
             return;
         };
@@ -247,7 +256,14 @@ impl App {
         let id = pending.id.clone();
         self.pending = None;
         match received {
-            Ok(t) => self.preview = Some((id, t)),
+            Ok(t) => {
+                self.preview_lower = t
+                    .entries
+                    .iter()
+                    .map(|e| e.event.searchable().to_lowercase())
+                    .collect();
+                self.preview = Some((id, t));
+            }
             Err(e) => {
                 self.status = format!("preview failed: {e}");
                 self.preview_error = Some(e);
@@ -573,10 +589,21 @@ impl App {
         let mut toggled: Option<String> = None;
         let mut next_hovered: Option<String> = None;
 
+        // Rows are laid out only for the visible range. That needs a fixed row
+        // height, so the two text lines below must not wrap: the title is
+        // truncated by the label, the meta line is a plain `horizontal`.
+        let row_height = ui
+            .text_style_height(&egui::TextStyle::Body)
+            .max(ui.spacing().interact_size.y)
+            + ui.spacing().item_spacing.y
+            + ui.text_style_height(&egui::TextStyle::Small)
+            + 2.0 * ROW_MARGIN_Y;
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (i, s) in self.visible.iter().enumerate() {
+            .show_rows(ui, row_height, self.visible.len(), |ui, range| {
+                for i in range {
+                    let s = &self.visible[i];
                     let focused = self.focused.as_deref() == Some(s.id.as_str());
                     let mut mark = self.marked.contains(&s.id);
 
@@ -593,7 +620,7 @@ impl App {
                     let mut checkbox_right = 0.0_f32;
                     let frame = egui::Frame::none()
                         .fill(fill)
-                        .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+                        .inner_margin(egui::Margin::symmetric(6.0, ROW_MARGIN_Y))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal_top(|ui| {
@@ -603,8 +630,11 @@ impl App {
                                 }
                                 checkbox_right = cb.rect.right();
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new(truncate(&s.title, 90)).strong());
-                                    ui.horizontal_wrapped(|ui| {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&s.title).strong())
+                                            .truncate(),
+                                    );
+                                    ui.horizontal(|ui| {
                                         ui.label(
                                             RichText::new(format!(
                                                 "{}  ·  {} msgs  ·  {}",
@@ -650,11 +680,11 @@ impl App {
                         clicked = Some((i, mods.ctrl || mods.command, mods.shift));
                     }
                 }
-                if self.visible.is_empty() {
-                    ui.add_space(20.0);
-                    ui.label(RichText::new("no sessions match").weak());
-                }
             });
+        if self.visible.is_empty() {
+            ui.add_space(20.0);
+            ui.label(RichText::new("no sessions match").weak());
+        }
 
         self.hovered = next_hovered;
 
@@ -761,7 +791,9 @@ impl App {
         let matches: Vec<&Entry> = transcript
             .entries
             .iter()
-            .filter(|e| needle.is_empty() || e.event.searchable().to_lowercase().contains(&needle))
+            .zip(&self.preview_lower)
+            .filter(|(_, lower)| needle.is_empty() || lower.contains(&needle))
+            .map(|(e, _)| e)
             .collect();
 
         if !needle.is_empty() {
@@ -976,7 +1008,7 @@ fn draw_entry(ui: &mut egui::Ui, entry: &Entry) {
         Event::Assistant(text) => block(ui, "claude", ROLE_ASSISTANT, &stamp, side, text),
         Event::Thinking(text) => {
             egui::CollapsingHeader::new(
-                RichText::new(format!("thinking · {} chars", text.len()))
+                RichText::new(format!("thinking · {} chars", text.chars().count()))
                     .small()
                     .color(ROLE_THINKING),
             )

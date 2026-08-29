@@ -36,6 +36,12 @@ impl ClaudeDir {
     /// Every path that belongs to a session and should go away with it.
     /// Only paths that actually exist are returned.
     pub fn session_paths(&self, project_slug: &str, id: &str) -> Vec<PathBuf> {
+        // `projects/<slug>/.` is the project dir and `projects/<slug>/..` is
+        // all of them; both canonicalize to inside the root and would pass
+        // `contains`. Refuse before building the paths at all.
+        if !is_session_id(id) {
+            return Vec::new();
+        }
         let candidates = [
             self.projects()
                 .join(project_slug)
@@ -68,16 +74,28 @@ fn canon(path: &Path) -> std::io::Result<PathBuf> {
     })
 }
 
-/// Display label for a project with no recorded `cwd`. Slugification maps every
-/// separator to `-`, so it cannot be reversed - show the slug as-is rather than
-/// inventing a path that looks real but isn't.
-pub fn slug_hint(slug: &str) -> String {
-    slug.to_string()
+/// A file stem that can safely be joined onto a directory as one component.
+/// Ids come from file names, not validated UUIDs, so this is the only thing
+/// standing between a stray `..jsonl` and a delete plan for a whole directory.
+pub fn is_session_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_paths_refuses_directory_walking_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("claude");
+        std::fs::create_dir_all(root.join("projects").join("slug")).unwrap();
+        let dir = ClaudeDir::resolve(Some(&root)).unwrap();
+
+        for id in [".", "..", "", "a/b", "a\\b"] {
+            assert!(dir.session_paths("slug", id).is_empty(), "{id:?}");
+        }
+    }
 
     #[test]
     fn contains_rejects_outside_paths() {

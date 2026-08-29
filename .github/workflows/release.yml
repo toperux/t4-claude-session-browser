@@ -144,24 +144,6 @@ jobs:
                   "$env:GITHUB_WORKSPACE\installer\csb.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
 
-      # Separate from staging so the installer, built above, gets a sidecar too.
-      - name: Checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/dist"
-          for f in *; do
-            [ -f "$f" ] || continue
-            case "$f" in *.sha256) continue ;; esac
-            if command -v sha256sum >/dev/null 2>&1; then
-              hash=$(sha256sum "$f" | cut -d' ' -f1)
-            else
-              hash=$(shasum -a 256 "$f" | cut -d' ' -f1)
-            fi
-            printf '%s  %s' "$hash" "$f" > "$f.sha256"
-            echo "$f  $hash"
-          done
-
       - uses: actions/upload-artifact@v4
         with:
           name: packages-${{ matrix.target }}
@@ -176,6 +158,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # One SHA256SUMS for the whole release rather than a `.sha256` sidecar per
+      # asset: a sidecar's name contains the target triple, so the updater's
+      # substring match could pick it over the archive it describes.
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * | tee SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -231,8 +223,9 @@ jobs:
 
             ### Verifying a download
 
-            Every asset ships a `.sha256` sidecar. Check one with `sha256sum -c`
-            on Linux, `shasum -a 256 -c` on macOS, or on Windows:
+            `SHA256SUMS` lists every asset. Check yours with
+            `sha256sum --ignore-missing -c SHA256SUMS` on Linux,
+            `shasum -a 256 --ignore-missing -c SHA256SUMS` on macOS, or on Windows:
 
             ```powershell
             Get-FileHash '.\<file>' -Algorithm SHA256

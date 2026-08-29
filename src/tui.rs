@@ -293,6 +293,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     app.refilter();
                 }
                 KeyCode::Enter => {}
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.quit = true;
+                }
                 KeyCode::Backspace => {
                     app.filter.pop();
                     app.refilter();
@@ -339,7 +342,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+        KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('c') if ctrl => app.quit = true,
         KeyCode::Tab => {
             app.focus = match app.focus {

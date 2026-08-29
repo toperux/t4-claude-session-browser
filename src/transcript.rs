@@ -76,10 +76,6 @@ pub fn load(path: &Path, opts: &LoadOpts) -> Result<Transcript> {
         if line.is_empty() {
             continue;
         }
-        if out.entries.len() >= opts.max_entries {
-            out.truncated = true;
-            break;
-        }
         let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
@@ -93,9 +89,15 @@ pub fn load(path: &Path, opts: &LoadOpts) -> Result<Transcript> {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Utc));
 
-        for event in events_from(&v) {
-            if !opts.include_meta && matches!(event, Event::Meta(_)) {
-                continue;
+        let events = events_from(&v)
+            .into_iter()
+            .filter(|e| opts.include_meta || !matches!(e, Event::Meta(_)));
+        for event in events {
+            // Checked per event, not per line: a trailing line that yields
+            // nothing must not report the transcript as cut short.
+            if out.entries.len() >= opts.max_entries {
+                out.truncated = true;
+                return Ok(out);
             }
             out.entries.push(Entry {
                 ts,

@@ -108,7 +108,7 @@ fn main() -> Result<()> {
             json,
         }) => {
             let index = index_for_cli(&dir)?;
-            cli::list(&dir, &index, project.as_deref(), sort, json)
+            cli::list(&index, project.as_deref(), sort, json)
         }
         Some(Cmd::Projects) => {
             let index = index_for_cli(&dir)?;

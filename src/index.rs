@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::paths::{slug_hint, ClaudeDir};
+use crate::paths::{is_session_id, ClaudeDir};
 
 /// A session that is younger than this is probably still being written to.
 pub const RECENT_SECS: i64 = 300;
@@ -55,15 +55,25 @@ impl SessionMeta {
         })
     }
 
-    /// Likely a live session someone is using right now.
+    /// Likely a live session someone is using right now. The file mtime counts
+    /// as well as the last record timestamp: a session whose tail records carry
+    /// no `timestamp` is still being written to.
     pub fn is_recent(&self) -> bool {
-        (Utc::now() - self.activity()).num_seconds() < RECENT_SECS
+        let mtime = Utc
+            .timestamp_millis_opt(self.modified_ms)
+            .single()
+            .unwrap_or(DateTime::UNIX_EPOCH);
+        let touched = self.activity().max(mtime);
+        (Utc::now() - touched).num_seconds() < RECENT_SECS
     }
 
+    /// Slugification maps every separator to `-`, so it cannot be reversed -
+    /// with no recorded `cwd` the slug is shown as-is rather than inventing a
+    /// path that looks real but isn't.
     pub fn location(&self) -> String {
         self.cwd
             .clone()
-            .unwrap_or_else(|| slug_hint(&self.project_slug))
+            .unwrap_or_else(|| self.project_slug.clone())
     }
 }
 
@@ -92,7 +102,10 @@ pub struct Index {
 impl Index {
     /// Scan every session file, reusing cached metadata where size+mtime match.
     pub fn build(dir: &ClaudeDir) -> Result<Self> {
-        let files = discover(dir)?;
+        let Discovered {
+            files,
+            mut warnings,
+        } = discover(dir)?;
         let cache = Cache::load();
 
         let scanned: Vec<Result<SessionMeta, String>> = files
@@ -111,7 +124,6 @@ impl Index {
             .collect();
 
         let mut sessions = Vec::with_capacity(scanned.len());
-        let mut warnings = Vec::new();
         for result in scanned {
             match result {
                 Ok(meta) => sessions.push(meta),
@@ -120,7 +132,7 @@ impl Index {
         }
 
         sessions.sort_by_key(|s| Reverse(s.activity()));
-        Cache::store(&sessions);
+        cache.store(&sessions, &dir.projects());
         Ok(Self { sessions, warnings })
     }
 
@@ -145,7 +157,7 @@ impl Index {
                 let label = sessions
                     .iter()
                     .find_map(|s| s.cwd.clone())
-                    .unwrap_or_else(|| slug_hint(slug));
+                    .unwrap_or_else(|| slug.to_string());
                 Project {
                     slug: slug.to_string(),
                     label,
@@ -175,26 +187,51 @@ impl Index {
     }
 }
 
-fn discover(dir: &ClaudeDir) -> Result<Vec<(String, PathBuf)>> {
+/// Session files plus a warning for every project directory that could not be
+/// read. Only the top-level `projects/` listing is fatal: one unreadable
+/// subdirectory must not take the whole index down.
+struct Discovered {
+    /// `(project slug, transcript path)` pairs.
+    files: Vec<(String, PathBuf)>,
+    warnings: Vec<String>,
+}
+
+fn discover(dir: &ClaudeDir) -> Result<Discovered> {
     let mut out = Vec::new();
+    let mut warnings = Vec::new();
     let projects = dir.projects();
     for entry in
         std::fs::read_dir(&projects).with_context(|| format!("reading {}", projects.display()))?
     {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let slug = entry.file_name().to_string_lossy().into_owned();
-        for f in std::fs::read_dir(entry.path())? {
-            let f = f?;
+        let files = match std::fs::read_dir(entry.path()) {
+            Ok(files) => files,
+            Err(e) => {
+                warnings.push(format!("{}: {e}", entry.path().display()));
+                continue;
+            }
+        };
+        for f in files.flatten() {
             let path = f.path();
-            if path.extension().is_some_and(|e| e == "jsonl") {
+            let is_session = path.extension().is_some_and(|e| e == "jsonl")
+                && path
+                    .file_stem()
+                    .is_some_and(|s| is_session_id(&s.to_string_lossy()));
+            if is_session {
                 out.push((slug.clone(), path));
             }
         }
     }
-    Ok(out)
+    Ok(Discovered {
+        files: out,
+        warnings,
+    })
 }
 
 fn to_millis(t: SystemTime) -> i64 {
@@ -247,9 +284,11 @@ fn scan_file(slug: &str, path: &Path, size_bytes: u64, modified_ms: i64) -> Resu
             _ => {}
         });
 
+        // Meta lines (the local-command caveat, injected reminders) are CLI
+        // scaffolding, not messages - counting them would hide `(empty session)`.
         if is_asst {
             assistant_msgs += 1;
-        } else if is_user && !is_result {
+        } else if is_user && !is_result && !flag_is_true(&line, &f_meta) {
             user_msgs += 1;
         }
 
@@ -512,12 +551,17 @@ fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// O(max), not O(len): the GUI calls this on every visible entry every frame,
+/// and a full `chars().count()` over a 12k-char turn adds up.
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if s.char_indices().nth(max).is_none() {
         return s.to_string();
     }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
+    let keep = s
+        .char_indices()
+        .nth(max.saturating_sub(1))
+        .map_or(0, |(i, _)| i);
+    format!("{}…", s[..keep].trim_end())
 }
 
 // ---------------------------------------------------------------- cache
@@ -563,14 +607,20 @@ impl Cache {
         (hit.size_bytes == size && hit.modified_ms == modified_ms).then(|| hit.clone())
     }
 
-    fn store(sessions: &[SessionMeta]) {
+    /// Entries under `projects` are replaced wholesale, so deleted sessions
+    /// fall out; entries from any other claude dir (`--claude-dir`) are kept,
+    /// so switching between trees does not throw the other one's work away.
+    fn store(mut self, sessions: &[SessionMeta], projects: &Path) {
         let Some(path) = Self::file() else { return };
+        self.entries.retain(|_, s| !s.path.starts_with(projects));
+        self.entries.extend(
+            sessions
+                .iter()
+                .map(|s| (s.path.to_string_lossy().into_owned(), s.clone())),
+        );
         let cache = Cache {
             schema: CACHE_SCHEMA,
-            entries: sessions
-                .iter()
-                .map(|s| (s.path.to_string_lossy().into_owned(), s.clone()))
-                .collect(),
+            entries: self.entries,
         };
         let Ok(json) = serde_json::to_vec(&cache) else {
             return;
@@ -635,6 +685,29 @@ mod tests {
             tool_calls: 0,
         };
         assert_eq!(meta.activity(), DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn meta_only_sessions_are_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        std::fs::write(
+            &path,
+            br#"{"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#,
+        )
+        .unwrap();
+        let meta = scan_file("slug", &path, 1, 0).unwrap();
+        assert_eq!(meta.user_msgs, 0);
+        assert_eq!(meta.title, "(empty session)");
+    }
+
+    #[test]
+    fn truncate_counts_chars() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abcd", 3), "ab…");
+        assert_eq!(truncate("日本語テ", 3), "日本…");
+        assert_eq!(truncate("ab  cd", 4), "ab…");
+        assert_eq!(truncate("", 0), "");
     }
 
     #[test]

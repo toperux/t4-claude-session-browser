@@ -1,7 +1,10 @@
 [package]
 name = "claude-session-browser"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
+# `Option::is_none_or`; without this an older toolchain fails with an opaque
+# "method not found" instead of a version message.
+rust-version = "1.82"
 description = "Browse, preview and delete Claude Code sessions - GUI, TUI and CLI in one binary"
 license = "MIT"
 repository = "https://github.com/toperux/t4-claude-session-browser"

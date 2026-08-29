@@ -18,14 +18,7 @@ pub enum Sort {
 
 // Table headers stay as args so they share the row format string's width specs.
 #[allow(clippy::print_literal)]
-pub fn list(
-    dir: &ClaudeDir,
-    index: &Index,
-    project: Option<&str>,
-    sort: Sort,
-    as_json: bool,
-) -> Result<()> {
-    let _ = dir;
+pub fn list(index: &Index, project: Option<&str>, sort: Sort, as_json: bool) -> Result<()> {
     let mut sessions: Vec<&SessionMeta> = index
         .sessions
         .iter()
@@ -115,8 +108,10 @@ pub fn projects(index: &Index) -> Result<()> {
 pub fn show(index: &Index, needle: &str, raw: bool, sidechains: bool) -> Result<()> {
     let meta = index.find(needle)?;
     if raw {
-        let body = std::fs::read_to_string(&meta.path)?;
-        print!("{body}");
+        // Streamed as bytes: a transcript is not guaranteed to be valid UTF-8
+        // end to end, and `--raw` promises the file as it is.
+        let mut file = std::fs::File::open(&meta.path)?;
+        std::io::copy(&mut file, &mut std::io::stdout().lock())?;
         return Ok(());
     }
 
@@ -306,7 +301,9 @@ pub fn parse_duration(spec: &str) -> Result<Duration> {
 
 /// `csb update` / `csb update --check` / `csb update --force`.
 pub fn update(check_only: bool, force: bool) -> Result<()> {
-    if crate::update::checks_disabled() {
+    // The opt-out covers *checks*; an explicit `csb update` is the user asking
+    // for the install and still goes ahead.
+    if check_only && crate::update::checks_disabled() {
         println!("update checks are disabled (CSB_NO_UPDATE_CHECK is set)");
         return Ok(());
     }

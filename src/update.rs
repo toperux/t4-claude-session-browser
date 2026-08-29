@@ -34,6 +34,9 @@ const BINARIES: &[&str] = if cfg!(windows) {
     &["csb"]
 };
 
+/// Archive format the release workflow uses for this platform.
+const ARCHIVE_EXT: &str = if cfg!(windows) { ".zip" } else { ".tar.gz" };
+
 /// `stem` is the binary's name without any platform suffix. `install_path` aims
 /// the replacement at one specific file rather than at whatever happens to be
 /// running - with two binaries, "the current exe" is the wrong target for one of
@@ -51,6 +54,10 @@ fn updater(
         // Looked up *inside* the archive, so it needs the platform suffix:
         // plain "csb" would never match "csb.exe".
         .bin_name(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
+        // Asset matching is substring-based and takes the first hit, so name
+        // the archive type too: the installer (`csb-setup-*.exe`) must never be
+        // picked, whatever GitHub's asset order turns out to be.
+        .asset_identifier(ARCHIVE_EXT)
         // Every pass compares against the *running* binary's version, not the
         // version of the file it is about to overwrite - there is no cheap way
         // to read the latter. So after a half-applied update (see `install`),
@@ -146,13 +153,18 @@ pub fn check_throttled() -> Result<Option<Available>> {
             .map(|version| Available { version }));
     }
 
-    let found = check()?;
+    // The throttle advances on failure too: "once a day" means once a day,
+    // not once per launch while offline.
+    let found = check();
     CheckCache {
         last_check_secs: now,
-        last_seen: found.as_ref().map(|a| a.version.clone()),
+        last_seen: found
+            .as_ref()
+            .ok()
+            .and_then(|f| f.as_ref().map(|a| a.version.clone())),
     }
     .store();
-    Ok(found)
+    found
 }
 
 fn is_newer(version: &str) -> bool {

@@ -42,19 +42,14 @@ fn report(message: &str) {
     }
 
     const MB_OK: u32 = 0x0000_0000;
-    const MB_ICONINFORMATION: u32 = 0x0000_0040;
+    const MB_ICONERROR: u32 = 0x0000_0010;
 
     let text = wide(message);
     let caption = wide("Claude Session Browser");
     // SAFETY: both pointers are to NUL-terminated UTF-16 buffers that outlive
     // the call, and a null owner handle means a message box with no parent.
     unsafe {
-        MessageBoxW(
-            0,
-            text.as_ptr(),
-            caption.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
+        MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
     }
 }
 
