@@ -61,6 +61,7 @@ opt-level = 2
 [package.metadata.deb]
 name = "csb"
 maintainer = "Christopher Montevirgen"
+copyright = "2026, Christopher Montevirgen"
 section = "utils"
 priority = "optional"
 depends = "$auto, libgl1, libx11-6, libxkbcommon0, libwayland-client0"
