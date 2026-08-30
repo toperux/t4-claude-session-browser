@@ -1,6 +1,6 @@
 [package]
 name = "claude-session-browser"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 # `Option::is_none_or`; without this an older toolchain fails with an opaque
 # "method not found" instead of a version message.
