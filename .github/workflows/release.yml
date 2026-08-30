@@ -30,6 +30,13 @@ jobs:
         run: |
           set -euo pipefail
           crate=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          # Plain x.y.z only: the rpm tooling rejects a `-rc.1` suffix and
+          # cargo-deb rewrites it to `~rc.1`, so the install scripts' asset
+          # names would no longer line up.
+          if ! [[ "$crate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version $crate is not a plain x.y.z release" >&2
+            exit 1
+          fi
           # workflow_dispatch has no tag, so there is nothing to compare against.
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             tag="${GITHUB_REF_NAME#v}"
@@ -110,6 +117,11 @@ jobs:
           if [ '${{ runner.os }}' = 'Windows' ]; then
             cp "target/${{ matrix.target }}/release/csb-gui.exe" "$stage/"
           fi
+          # Linux also gets the desktop entry and icon, for install-user.sh to
+          # put under ~/.local/share.
+          if [ '${{ runner.os }}' = 'Linux' ]; then
+            cp installer/csb.desktop assets/csb.png "$stage/"
+          fi
           cp README.md LICENSE "$stage/"
 
           name="csb-${{ matrix.target }}"
@@ -117,7 +129,9 @@ jobs:
           if [ '${{ matrix.archive }}' = 'zip' ]; then
             7z a -tzip "$out/$name.zip" ./* >/dev/null
           else
-            tar czf "$out/$name.tar.gz" ./*
+            # Bare names, not `./*`: GNU tar's member matching is literal, so a
+            # `./csb` entry is invisible to `tar x ... csb`.
+            tar czf "$out/$name.tar.gz" -- *
           fi
 
       # The installer is named csb-setup-<version>-x64.exe on purpose: it must
@@ -143,6 +157,29 @@ jobs:
                   "/DOutDir=$env:GITHUB_WORKSPACE\dist" `
                   "$env:GITHUB_WORKSPACE\installer\csb.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+      # .deb and .rpm alongside the tarball. Their names carry neither the
+      # target triple nor ".tar.gz", so the updater's asset match ignores them.
+      # Asset lists live in Cargo.toml under [package.metadata.deb] and
+      # [package.metadata.generate-rpm]; `--target` makes both tools look under
+      # target/<triple>/release instead of target/release.
+      - name: Install the Linux packaging tools
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: taiki-e/install-action@v2
+        with:
+          # Pinned to a major/minor: install.sh reads the package names off
+          # SHA256SUMS, but the target-path substitution and revision suffix
+          # are still these tools' conventions.
+          tool: cargo-deb@2,cargo-generate-rpm@0.16
+
+      - name: Build the Linux packages
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo deb --no-build --target ${{ matrix.target }} --output dist/
+          cargo generate-rpm --target ${{ matrix.target }} --output dist/
+          ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -182,6 +219,27 @@ jobs:
             to your `PATH`, and puts the desktop app in the Start Menu. Open a
             **new** terminal afterwards for `PATH` to take effect.
 
+            **Linux:** one command downloads the `.deb` or `.rpm` and installs it
+            with `apt`/`dnf`/`zypper`:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/toperux/t4-claude-session-browser/main/installer/install.sh | sh
+            ```
+
+            Or grab the package below and `sudo apt install ./csb_*.deb` /
+            `sudo dnf install ./csb-*.rpm`. That puts `csb` in `/usr/bin` and the
+            desktop app in your application menu. A package install is upgraded
+            by re-running the command; `csb update` refuses to touch a file the
+            package manager owns. The rpm names Fedora's library packages, so it
+            may not install on openSUSE.
+
+            **Linux or macOS, no root:** installs the tarball's binary to
+            `~/.local/bin`, where `csb update` can upgrade it in place:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/toperux/t4-claude-session-browser/main/installer/install-user.sh | sh
+            ```
+
             Otherwise download the archive for your platform, unpack it, and put
             `csb` somewhere on your `PATH`.
 
@@ -189,7 +247,9 @@ jobs:
             |---|---|
             | Windows x64 (installer) | `csb-setup-${{ needs.version.outputs.version }}-x64.exe` |
             | Windows x64 (portable) | `csb-x86_64-pc-windows-msvc.zip` |
-            | Linux x64 | `csb-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux x64 (Debian/Ubuntu) | `csb_${{ needs.version.outputs.version }}-1_amd64.deb` |
+            | Linux x64 (Fedora) | `csb-${{ needs.version.outputs.version }}-1.x86_64.rpm` |
+            | Linux x64 (tarball) | `csb-x86_64-unknown-linux-gnu.tar.gz` |
             | macOS (Apple Silicon) | `csb-aarch64-apple-darwin.tar.gz` |
             | macOS (Intel) | `csb-x86_64-apple-darwin.tar.gz` |
 

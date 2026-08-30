@@ -401,11 +401,18 @@ impl App {
                             .strong(),
                     );
                     ui.label(RichText::new(format!("you have {}", crate::update::CURRENT)).weak());
-                    let update =
-                        egui::Button::new(RichText::new("Update").strong().color(Color32::BLACK))
-                            .fill(ROLE_TOOL);
-                    if ui.add(update).clicked() {
-                        self.install_rx = Some(spawn_install(ctx.clone()));
+                    if crate::update::package_managed() {
+                        // An Update button here would only fail; say what works.
+                        ui.label(RichText::new("upgrade it with your package manager").weak())
+                            .on_hover_text(crate::update::PACKAGE_MANAGED_HINT);
+                    } else {
+                        let update = egui::Button::new(
+                            RichText::new("Update").strong().color(Color32::BLACK),
+                        )
+                        .fill(ROLE_TOOL);
+                        if ui.add(update).clicked() {
+                            self.install_rx = Some(spawn_install(ctx.clone()));
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Dismiss").clicked() {

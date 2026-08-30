@@ -12,6 +12,28 @@ It installs for the current user only, so there is no admin prompt; it adds `csb
 to your `PATH` and puts the desktop app in the Start Menu. Open a **new** terminal
 afterwards, or `PATH` won't have caught up.
 
+**Linux** — one command fetches the latest `.deb` or `.rpm` and installs it with
+`apt`/`dnf`/`zypper` (it will ask for `sudo`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/toperux/t4-claude-session-browser/main/installer/install.sh | sh
+```
+
+Or download `csb_<version>-1_amd64.deb` / `csb-<version>-1.x86_64.rpm` from the
+release yourself and `sudo apt install ./csb_*.deb` or `sudo dnf install ./csb-*.rpm`.
+Either way `csb` lands in `/usr/bin` and the desktop app in your application
+menu. Packaged installs are upgraded by re-running the command (or installing the
+next package); `csb update` refuses to touch a file the package manager owns.
+The rpm names Fedora's library packages, so it may not install on openSUSE.
+
+**Linux or macOS, no root** — installs the tarball's binary to `~/.local/bin`
+(override with `CSB_INSTALL_DIR`). Since that is yours to write, `csb update`
+upgrades it in place afterwards:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/toperux/t4-claude-session-browser/main/installer/install-user.sh | sh
+```
+
 **Anything else** — grab the archive for your platform from the same place, unpack
 it, and put `csb` on your `PATH`. `SHA256SUMS` alongside the assets lists their hashes.
 

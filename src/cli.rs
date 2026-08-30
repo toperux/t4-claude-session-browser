@@ -337,7 +337,11 @@ pub fn update(check_only: bool, force: bool) -> Result<()> {
             crate::update::REPO_NAME,
             found.version
         );
-        println!("\nrun `csb update` to install it");
+        if crate::update::package_managed() {
+            println!("\n{}", crate::update::PACKAGE_MANAGED_HINT);
+        } else {
+            println!("\nrun `csb update` to install it");
+        }
         return Ok(());
     }
 

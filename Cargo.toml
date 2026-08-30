@@ -51,3 +51,34 @@ winresource = "0.1"
 
 [profile.release]
 opt-level = 2
+
+# Linux packages, built by cargo-deb / cargo-generate-rpm in the release
+# workflow. Both install the binary to /usr/bin plus a desktop entry and icon
+# so the GUI shows up in application menus. The listed runtime libraries are
+# what eframe's glow backend dlopens; the package tools only see DT_NEEDED, so
+# they cannot find those on their own. `$auto` keeps the detected ones (a
+# versioned libc6 in particular - the binary wants the builder's glibc).
+[package.metadata.deb]
+name = "csb"
+maintainer = "Christopher Montevirgen"
+section = "utils"
+priority = "optional"
+depends = "$auto, libgl1, libx11-6, libxkbcommon0, libwayland-client0"
+assets = [
+    ["target/release/csb", "usr/bin/", "755"],
+    ["installer/csb.desktop", "usr/share/applications/", "644"],
+    ["assets/csb.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["README.md", "usr/share/doc/csb/", "644"],
+]
+
+# Fedora package names. openSUSE calls these libGL1 / libX11-6 / ..., so the
+# rpm is Fedora-only until someone needs otherwise.
+[package.metadata.generate-rpm]
+name = "csb"
+requires = { mesa-libGL = "*", libX11 = "*", libxkbcommon = "*", libwayland-client = "*" }
+assets = [
+    { source = "target/release/csb", dest = "/usr/bin/csb", mode = "755" },
+    { source = "installer/csb.desktop", dest = "/usr/share/applications/csb.desktop", mode = "644" },
+    { source = "assets/csb.png", dest = "/usr/share/icons/hicolor/256x256/apps/csb.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/csb/README.md", mode = "644", doc = true },
+]

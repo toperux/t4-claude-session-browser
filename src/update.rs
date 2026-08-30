@@ -83,6 +83,26 @@ pub fn check() -> Result<Option<Available>> {
     }))
 }
 
+/// What to tell the user instead of updating, when this binary was installed
+/// by the .deb/.rpm and therefore belongs to the package manager.
+pub const PACKAGE_MANAGED_HINT: &str =
+    "csb was installed by a system package; upgrade it with your package manager \
+     (re-run installer/install.sh, or install the new .deb/.rpm from the release)";
+
+/// True when the running binary lives in `/usr/bin`, which is where the
+/// .deb/.rpm put it and where nothing else installs (the tarball route uses
+/// `~/.local/bin`, `/usr/local/bin`, or wherever the user unpacked it). An
+/// in-place swap there would work under sudo, but it leaves dpkg/rpm believing
+/// they own a file they no longer wrote - and the next package upgrade would
+/// quietly put the old binary back.
+pub fn package_managed() -> bool {
+    cfg!(unix)
+        && std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d == std::path::Path::new("/usr/bin")))
+            .unwrap_or(false)
+}
+
 /// Download the release and replace every binary this platform ships.
 ///
 /// `self_update` stages its temp files in the target's own directory, so this
@@ -94,6 +114,9 @@ pub fn check() -> Result<Option<Available>> {
 /// shows the update banner, a stale `csb-gui.exe` would offer the same update
 /// forever.
 pub fn install(progress: bool, force: bool) -> Result<self_update::VersionStatus> {
+    if package_managed() {
+        anyhow::bail!("{PACKAGE_MANAGED_HINT}");
+    }
     let exe = std::env::current_exe().context("cannot locate the running executable")?;
     let dir = exe
         .parent()

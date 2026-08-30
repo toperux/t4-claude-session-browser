@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Session Browser
+Comment=Browse, preview and delete Claude Code sessions
+Exec=csb gui
+Icon=csb
+Terminal=false
+Categories=Utility;Development;
+Keywords=claude;sessions;cleanup;
