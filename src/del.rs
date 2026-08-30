@@ -49,6 +49,18 @@ pub fn execute(dir: &ClaudeDir, plan: &DeletePlan) -> Result<()> {
             );
         }
     }
+    // On a Windows drive mounted into WSL, `trash` sees a foreign mount and
+    // makes a `/mnt/c/.Trash-<uid>` of its own: files vanish from Claude's
+    // view but never reach the Recycle Bin, and drvfs often refuses the
+    // rename anyway. Nothing sensible to do from this side of the boundary.
+    if crate::paths::is_wsl() {
+        if let Some(p) = plan.paths.iter().find(|p| crate::paths::is_wsl_drvfs(p)) {
+            bail!(
+                "{} is on a Windows drive; WSL cannot move it to the Recycle Bin - run csb from Windows instead",
+                p.display()
+            );
+        }
+    }
     trash::delete_all(&plan.paths)?;
     Ok(())
 }

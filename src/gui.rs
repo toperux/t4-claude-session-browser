@@ -32,19 +32,117 @@ enum Sort {
 
 pub fn run(dir: ClaudeDir) -> Result<()> {
     let app = App::new(dir)?;
+
+    // WSLg's Weston (9.x, RDP backend) kills the connection with an xdg_surface
+    // size-mismatch protocol error if a committed buffer disagrees with a
+    // configure - seen when a snap/maximise handed out a size below the old
+    // 900x500 minimum, which winit clamps to. winit then exits its loop
+    // ("Broken pipe") and the window just disappears. The minimum is smaller
+    // now; CSB_X11=1 routes through XWayland instead, which has no such
+    // contract but gets Weston's own (plain, 1x) window frame rather than the
+    // native Windows one. The same compositor also reports scale=1 whatever
+    // Windows is set to, which is what the zoom below is for.
+    let wsl = crate::paths::is_wsl();
+    if wsl
+        && std::env::var_os("CSB_X11").is_some_and(|v| !v.is_empty() && v != "0")
+        && std::env::var_os("DISPLAY").is_some()
+    {
+        // winit's X11 backend dlopens this and panics without it, and stock
+        // Ubuntu (WSL's default) does not ship it.
+        if has_xkbcommon_x11() {
+            std::env::remove_var("WAYLAND_DISPLAY");
+        } else {
+            eprintln!(
+                "csb: libxkbcommon-x11.so.0 not found, staying on Wayland; \
+                 `sudo apt install libxkbcommon-x11-0` for CSB_X11"
+            );
+        }
+    }
+    // Zoom, not pixels_per_point: it multiplies the native scale, so it keeps
+    // applying if the compositor later reports a real one.
+    let zoom = std::env::var("CSB_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .or_else(|| if wsl { wsl_host_zoom() } else { None })
+        .filter(|z| (0.5..=4.0).contains(z));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 880.0])
-            .with_min_inner_size([900.0, 500.0])
+            // Below a maximised 1080p work area at 150% scaling; a larger
+            // minimum makes the compositor hand out sizes we said we refuse.
+            .with_min_inner_size([640.0, 400.0])
             .with_title("Claude Session Browser"),
         ..Default::default()
     };
     eframe::run_native(
         "Claude Session Browser",
         options,
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            if let Some(z) = zoom {
+                cc.egui_ctx.set_zoom_factor(z);
+            }
+            Ok(Box::new(app))
+        }),
     )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    .map_err(|e| {
+        if wsl {
+            anyhow::anyhow!(
+                "{e}\n\nunder WSL: `CSB_X11=1 csb` avoids WSLg's Wayland resize problem; \
+                 `LIBGL_ALWAYS_SOFTWARE=1 csb` rules out the GPU driver"
+            )
+        } else {
+            anyhow::anyhow!("{e}")
+        }
+    })
+}
+
+/// Whether the X11 keyboard library winit needs is installed. A path probe
+/// rather than a dlopen: the usual multiarch and lib64 spots cover every
+/// distro WSL ships, and a wrong "no" only costs the X11 route.
+fn has_xkbcommon_x11() -> bool {
+    [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/usr/local/lib",
+    ]
+    .iter()
+    .any(|d| {
+        std::path::Path::new(d)
+            .join("libxkbcommon-x11.so.0")
+            .exists()
+    })
+}
+
+/// The Windows display scale, read through WSL's interop: WSLg tells apps
+/// scale 1 whatever Windows is set to, but `reg.exe` runs from inside the
+/// distro and the registry has the answer. `AppliedDPI` is the primary
+/// monitor's value (96 = 100%, 120 = 125%, 144 = 150%); `None` when interop
+/// is off or the value is the default, so the caller changes nothing.
+fn wsl_host_zoom() -> Option<f32> {
+    let out = std::process::Command::new("/mnt/c/Windows/System32/reg.exe")
+        .args([
+            "query",
+            r"HKCU\Control Panel\Desktop\WindowMetrics",
+            "/v",
+            "AppliedDPI",
+        ])
+        // Windows binaries warn about a Linux cwd; give them one they know.
+        .current_dir("/mnt/c")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let hex = text
+        .lines()
+        .find(|l| l.contains("AppliedDPI"))?
+        .split_whitespace()
+        .last()?
+        .strip_prefix("0x")?;
+    let dpi = u32::from_str_radix(hex, 16).ok()?;
+    (dpi != 96 && dpi > 0).then(|| dpi as f32 / 96.0)
 }
 
 /// Ask GitHub for a newer release off the UI thread. The startup check is
@@ -143,6 +241,8 @@ struct App {
     /// An install in flight, and its result once it lands.
     install_rx: Option<Receiver<Result<String, String>>>,
     installed: Option<String>,
+    /// Running under WSL; see the repaint heartbeat in `update`.
+    wsl: bool,
 }
 
 impl App {
@@ -177,6 +277,7 @@ impl App {
             update_banner: None,
             install_rx: None,
             installed: None,
+            wsl: crate::paths::is_wsl(),
         };
         app.status = app.index.warning_summary().unwrap_or_default();
         app.rebuild_projects();
@@ -530,6 +631,14 @@ impl eframe::App for App {
         }
         if let Some(plans) = self.confirm.take() {
             self.confirm_modal(ctx, plans);
+        }
+
+        // XWayland under WSLg sometimes delivers a resize with no event eframe
+        // repaints on, leaving the old frame stretched or clipped until the
+        // mouse moves. A slow heartbeat bounds that to a blink; at ~7 fps it
+        // costs nothing measurable.
+        if self.wsl {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
 }

@@ -81,6 +81,38 @@ pub fn is_session_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
 }
 
+/// Running inside Windows Subsystem for Linux. The binfmt entry is what WSL
+/// registers to run .exe files, and it exists in every distro; the env var is
+/// the fallback for a shell that was started without it.
+pub fn is_wsl() -> bool {
+    cfg!(target_os = "linux")
+        && (Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+            || std::env::var_os("WSL_DISTRO_NAME").is_some())
+}
+
+/// A path on a Windows drive mounted into WSL (`/mnt/c/...`). Deleting there
+/// goes through drvfs, where `trash` cannot reach the Windows Recycle Bin.
+pub fn is_wsl_drvfs(path: &Path) -> bool {
+    let mut parts = path.components().skip(1); // RootDir
+    matches!(parts.next(), Some(std::path::Component::Normal(m)) if m == "mnt")
+        && matches!(parts.next(), Some(std::path::Component::Normal(d))
+            if d.len() == 1 && d.to_str().is_some_and(|d| d.chars().all(|c| c.is_ascii_alphabetic())))
+}
+
+#[cfg(test)]
+mod wsl_tests {
+    use super::*;
+
+    #[test]
+    fn drvfs_paths_are_windows_drive_mounts_only() {
+        assert!(is_wsl_drvfs(Path::new("/mnt/c/Users/x/.claude")));
+        assert!(is_wsl_drvfs(Path::new("/mnt/D/x")));
+        assert!(!is_wsl_drvfs(Path::new("/mnt/wslg/x")));
+        assert!(!is_wsl_drvfs(Path::new("/home/x/.claude")));
+        assert!(!is_wsl_drvfs(Path::new("/mnt")));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

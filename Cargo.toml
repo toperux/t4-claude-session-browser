@@ -64,7 +64,7 @@ maintainer = "Christopher Montevirgen"
 copyright = "2026, Christopher Montevirgen"
 section = "utils"
 priority = "optional"
-depends = "$auto, libgl1, libx11-6, libxkbcommon0, libwayland-client0"
+depends = "$auto, libgl1, libx11-6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0"
 assets = [
     ["target/release/csb", "usr/bin/", "755"],
     ["installer/csb.desktop", "usr/share/applications/", "644"],
@@ -76,7 +76,7 @@ assets = [
 # rpm is Fedora-only until someone needs otherwise.
 [package.metadata.generate-rpm]
 name = "csb"
-requires = { mesa-libGL = "*", libX11 = "*", libxkbcommon = "*", libwayland-client = "*" }
+requires = { mesa-libGL = "*", libX11 = "*", libxkbcommon = "*", libxkbcommon-x11 = "*", libwayland-client = "*" }
 assets = [
     { source = "target/release/csb", dest = "/usr/bin/csb", mode = "755" },
     { source = "installer/csb.desktop", dest = "/usr/share/applications/csb.desktop", mode = "644" },

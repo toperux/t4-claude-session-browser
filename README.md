@@ -119,6 +119,24 @@ One cosmetic wart if you used the installer: a self-update swaps the binaries bu
 doesn't touch the uninstall registry entry, so Add/Remove Programs keeps showing
 the version you installed. Running the new installer resyncs it.
 
+## WSL
+
+The Linux build runs under WSLg, with two adjustments it makes on its own:
+
+- If resizing or snapping the window makes it vanish ("Broken pipe" in the
+  terminal), that is WSLg's Wayland compositor rejecting a frame. `CSB_X11=1 csb`
+  goes through XWayland instead, which does not have the problem but draws a
+  plainer window frame. It needs `libxkbcommon-x11-0` (`sudo apt install
+  libxkbcommon-x11-0`; the .deb/.rpm pull it in).
+- WSLg reports 100% scaling whatever Windows is set to, so `csb` reads the
+  Windows display scale from the registry (via `reg.exe`) and zooms to match.
+  `CSB_SCALE=1.25` (or 1.5, 2) overrides that, e.g. for a non-primary monitor.
+
+Sessions on a Windows drive (`--claude-dir /mnt/c/Users/you/.claude`) can be
+browsed but not deleted from WSL: the Recycle Bin is out of reach there, so
+`csb` refuses rather than stranding files in a `.Trash-1000` on `C:`. Delete
+those from the Windows build.
+
 ## Notes
 
 Sessions have no stored title, so one is derived: a `custom-title` record if present,
