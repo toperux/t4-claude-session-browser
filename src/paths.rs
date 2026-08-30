@@ -81,35 +81,67 @@ pub fn is_session_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
 }
 
-/// Running inside Windows Subsystem for Linux. The binfmt entry is what WSL
-/// registers to run .exe files, and it exists in every distro; the env var is
-/// the fallback for a shell that was started without it.
+/// Running inside Windows Subsystem for Linux. The kernel release names
+/// Microsoft in every WSL1/WSL2 build ("5.15.167.4-microsoft-standard-WSL2"),
+/// unlike the binfmt entry or WSL_DISTRO_NAME, which interop settings, sudo
+/// and systemd services can strip.
 pub fn is_wsl() -> bool {
     cfg!(target_os = "linux")
-        && (Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
-            || std::env::var_os("WSL_DISTRO_NAME").is_some())
+        && std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft"))
 }
 
-/// A path on a Windows drive mounted into WSL (`/mnt/c/...`). Deleting there
-/// goes through drvfs, where `trash` cannot reach the Windows Recycle Bin.
+/// A path on a Windows drive mounted into WSL. Deleting there goes through
+/// drvfs, where `trash` cannot reach the Windows Recycle Bin. Decided from the
+/// mount table rather than a `/mnt/<letter>` prefix, since `[automount] root`
+/// and manual `mount -t drvfs` put such mounts anywhere.
 pub fn is_wsl_drvfs(path: &Path) -> bool {
-    let mut parts = path.components().skip(1); // RootDir
-    matches!(parts.next(), Some(std::path::Component::Normal(m)) if m == "mnt")
-        && matches!(parts.next(), Some(std::path::Component::Normal(d))
-            if d.len() == 1 && d.to_str().is_some_and(|d| d.chars().all(|c| c.is_ascii_alphabetic())))
+    std::fs::read_to_string("/proc/mounts").is_ok_and(|m| on_drvfs_mount(path, &m))
+}
+
+/// `mounts` is `/proc/mounts`: "<dev> <mountpoint> <fstype> <opts> ...". WSL
+/// mounts Windows drives as `drvfs` (WSL1) or `9p` with `aname=drvfs` (WSL2).
+/// The longest mount point that prefixes `path` is the one that holds it.
+fn on_drvfs_mount(path: &Path, mounts: &str) -> bool {
+    mounts
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (_dev, point, fstype, opts) = (f.next()?, f.next()?, f.next()?, f.next()?);
+            // /proc/mounts escapes spaces in mount points as \040.
+            let point = PathBuf::from(point.replace("\\040", " "));
+            path.starts_with(&point).then_some((point, fstype, opts))
+        })
+        .max_by_key(|(point, _, _)| point.as_os_str().len())
+        .is_some_and(|(_, fstype, opts)| {
+            fstype == "drvfs" || (fstype == "9p" && opts.contains("aname=drvfs"))
+        })
 }
 
 #[cfg(test)]
 mod wsl_tests {
     use super::*;
 
+    const MOUNTS: &str = "\
+/dev/sdc / ext4 rw,relatime,discard,errors=remount-ro,data=ordered 0 0
+none /mnt/wslg tmpfs rw,relatime 0 0
+C:\\134 /mnt/c 9p rw,noatime,dirsync,aname=drvfs;path=C:\\;uid=1000;gid=1000;symlinkroot=/mnt/,mmap,access=client,msize=65536,trans=fd,rfd=6,wfd=6 0 0
+D:\\134 /mnt/data drvfs rw,relatime 0 0
+none /mnt/c/Users/x/tmp\\040dir tmpfs rw 0 0
+";
+
     #[test]
-    fn drvfs_paths_are_windows_drive_mounts_only() {
-        assert!(is_wsl_drvfs(Path::new("/mnt/c/Users/x/.claude")));
-        assert!(is_wsl_drvfs(Path::new("/mnt/D/x")));
-        assert!(!is_wsl_drvfs(Path::new("/mnt/wslg/x")));
-        assert!(!is_wsl_drvfs(Path::new("/home/x/.claude")));
-        assert!(!is_wsl_drvfs(Path::new("/mnt")));
+    fn drvfs_is_decided_by_the_longest_matching_mount() {
+        assert!(on_drvfs_mount(Path::new("/mnt/c/Users/x/.claude"), MOUNTS));
+        assert!(on_drvfs_mount(Path::new("/mnt/data/.claude"), MOUNTS));
+        assert!(!on_drvfs_mount(Path::new("/mnt/wslg/x"), MOUNTS));
+        assert!(!on_drvfs_mount(Path::new("/home/x/.claude"), MOUNTS));
+        // A non-drvfs mount nested inside a drvfs one wins for its subtree.
+        assert!(!on_drvfs_mount(
+            Path::new("/mnt/c/Users/x/tmp dir/f"),
+            MOUNTS
+        ));
+        assert!(!on_drvfs_mount(Path::new("/mnt/c"), ""));
     }
 }
 

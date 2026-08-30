@@ -30,27 +30,27 @@ enum Sort {
     Msgs,
 }
 
-pub fn run(dir: ClaudeDir) -> Result<()> {
-    let app = App::new(dir)?;
+/// Smallest window: the two left panels' floors (160 + 260) plus room for a
+/// preview, and enough height for the confirm dialog. Under a maximised,
+/// 150%-scaled 1080p work area.
+const MIN_WINDOW: [f32; 2] = [720.0, 480.0];
 
-    // WSLg's Weston (9.x, RDP backend) kills the connection with an xdg_surface
-    // size-mismatch protocol error if a committed buffer disagrees with a
-    // configure - seen when a snap/maximise handed out a size below the old
-    // 900x500 minimum, which winit clamps to. winit then exits its loop
-    // ("Broken pipe") and the window just disappears. The minimum is smaller
-    // now; CSB_X11=1 routes through XWayland instead, which has no such
-    // contract but gets Weston's own (plain, 1x) window frame rather than the
-    // native Windows one. The same compositor also reports scale=1 whatever
-    // Windows is set to, which is what the zoom below is for.
+pub fn run(dir: ClaudeDir) -> Result<()> {
+    // Under WSLg the window gets an in-app frame (see `with_decorations`
+    // below). CSB_X11=1 is the alternative: XWayland, with Weston's own plain
+    // 1x frame. WSLg also reports scale=1 whatever Windows is set to, which is
+    // what the zoom below is for.
     let wsl = crate::paths::is_wsl();
-    if wsl
-        && std::env::var_os("CSB_X11").is_some_and(|v| !v.is_empty() && v != "0")
-        && std::env::var_os("DISPLAY").is_some()
-    {
+    let want_x11 = std::env::var_os("CSB_X11").is_some_and(|v| !v.is_empty() && v != "0");
+    let mut x11 = false;
+    if wsl && want_x11 {
         // winit's X11 backend dlopens this and panics without it, and stock
         // Ubuntu (WSL's default) does not ship it.
-        if has_xkbcommon_x11() {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("csb: CSB_X11 set but DISPLAY is not; staying on Wayland");
+        } else if has_xkbcommon_x11() {
             std::env::remove_var("WAYLAND_DISPLAY");
+            x11 = true;
         } else {
             eprintln!(
                 "csb: libxkbcommon-x11.so.0 not found, staying on Wayland; \
@@ -58,20 +58,34 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
             );
         }
     }
+    // WSLg's Weston 9 segfaults when winit's client-side frame re-lays out
+    // its subsurfaces during a drag-resize (WSLGd logs "terminated with
+    // signal 11" and restarts it; the app sees a bare "Broken pipe").
+    // Compositor-driven resizes without a frame are fine, so on WSLg's
+    // Wayland the app draws its own title bar and edge zones - see
+    // `wsl_title_bar` / `wsl_frame_edges`. XWayland decorates on its own.
+    let own_frame = wsl && !x11;
+    let app = App::new(dir, own_frame, x11)?;
+
     // Zoom, not pixels_per_point: it multiplies the native scale, so it keeps
-    // applying if the compositor later reports a real one.
-    let zoom = std::env::var("CSB_SCALE")
+    // applying if the compositor later reports a real one. The registry value
+    // is only for the WSLg case where the native scale is a flat 1.0 - on top
+    // of a real Xft.dpi it would double-scale.
+    let explicit = std::env::var("CSB_SCALE")
         .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .or_else(|| if wsl { wsl_host_zoom() } else { None })
-        .filter(|z| (0.5..=4.0).contains(z));
+        .and_then(|s| s.parse::<f32>().ok());
+    let registry = if own_frame && explicit.is_none() {
+        wsl_host_zoom()
+    } else {
+        None
+    };
+    let zoom = explicit.filter(|z| (0.5..=4.0).contains(z));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 880.0])
-            // Below a maximised 1080p work area at 150% scaling; a larger
-            // minimum makes the compositor hand out sizes we said we refuse.
-            .with_min_inner_size([640.0, 400.0])
+            .with_min_inner_size(MIN_WINDOW)
+            .with_decorations(!own_frame)
             .with_title("Claude Session Browser"),
         ..Default::default()
     };
@@ -79,8 +93,19 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
         "Claude Session Browser",
         options,
         Box::new(move |cc| {
+            let native = cc
+                .egui_ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0);
+            let zoom = zoom.or(registry.filter(|_| (native - 1.0).abs() < 0.01));
             if let Some(z) = zoom {
                 cc.egui_ctx.set_zoom_factor(z);
+                // The builder's minimum was converted at the native scale;
+                // restate it so it means the same number of points.
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::Vec2::from(
+                        MIN_WINDOW,
+                    )));
             }
             Ok(Box::new(app))
         }),
@@ -122,17 +147,38 @@ fn has_xkbcommon_x11() -> bool {
 /// monitor's value (96 = 100%, 120 = 125%, 144 = 150%); `None` when interop
 /// is off or the value is the default, so the caller changes nothing.
 fn wsl_host_zoom() -> Option<f32> {
-    let out = std::process::Command::new("/mnt/c/Windows/System32/reg.exe")
-        .args([
-            "query",
-            r"HKCU\Control Panel\Desktop\WindowMetrics",
-            "/v",
-            "AppliedDPI",
-        ])
-        // Windows binaries warn about a Linux cwd; give them one they know.
-        .current_dir("/mnt/c")
-        .stderr(std::process::Stdio::null())
-        .output()
+    // On a thread with a deadline: a stalled interop (9p hang, `wsl
+    // --shutdown` in flight) must cost the zoom, not the window.
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        // The usual mount first; `reg.exe` via PATH covers a custom
+        // [automount] root, when Windows' PATH is appended (the default).
+        let reg = if std::path::Path::new("/mnt/c/Windows/System32/reg.exe").exists() {
+            "/mnt/c/Windows/System32/reg.exe"
+        } else {
+            "reg.exe"
+        };
+        let out = std::process::Command::new(reg)
+            .args([
+                "query",
+                r"HKCU\Control Panel\Desktop\WindowMetrics",
+                "/v",
+                "AppliedDPI",
+            ])
+            // Windows binaries warn about a Linux cwd; give them one they
+            // know. Any drvfs mount does; /mnt/c is only the usual one.
+            .current_dir(if std::path::Path::new("/mnt/c").is_dir() {
+                "/mnt/c"
+            } else {
+                "/"
+            })
+            .stderr(std::process::Stdio::null())
+            .output();
+        let _ = tx.send(out);
+    });
+    let out = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .ok()?
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let hex = text
@@ -241,12 +287,14 @@ struct App {
     /// An install in flight, and its result once it lands.
     install_rx: Option<Receiver<Result<String, String>>>,
     installed: Option<String>,
-    /// Running under WSL; see the repaint heartbeat in `update`.
-    wsl: bool,
+    /// Draw the title bar and resize edges ourselves (WSLg's Wayland).
+    own_frame: bool,
+    /// On XWayland under WSL; see the repaint heartbeat in `update`.
+    x11: bool,
 }
 
 impl App {
-    fn new(dir: ClaudeDir) -> Result<Self> {
+    fn new(dir: ClaudeDir, own_frame: bool, x11: bool) -> Result<Self> {
         let index = Index::build(&dir)?;
         let mut app = Self {
             dir,
@@ -277,7 +325,8 @@ impl App {
             update_banner: None,
             install_rx: None,
             installed: None,
-            wsl: crate::paths::is_wsl(),
+            own_frame,
+            x11,
         };
         app.status = app.index.warning_summary().unwrap_or_default();
         app.rebuild_projects();
@@ -613,6 +662,9 @@ impl eframe::App for App {
         self.poll_preview();
         self.poll_update(ctx);
 
+        if self.own_frame {
+            wsl_title_bar(ctx);
+        }
         self.update_bar(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         egui::TopBottomPanel::bottom("actions").show(ctx, |ui| self.action_bar(ui));
@@ -636,11 +688,185 @@ impl eframe::App for App {
         // XWayland under WSLg sometimes delivers a resize with no event eframe
         // repaints on, leaving the old frame stretched or clipped until the
         // mouse moves. A slow heartbeat bounds that to a blink; at ~7 fps it
-        // costs nothing measurable.
-        if self.wsl {
+        // costs little, and nothing at all while the window is not in focus.
+        if self.x11 && ctx.input(|i| i.viewport().focused).unwrap_or(true) {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
+        if self.own_frame {
+            wsl_frame_edges(ctx);
+        }
     }
+}
+
+/// Width of the resize zone along the window edge, in points.
+const WSL_EDGE: f32 = 6.0;
+
+/// The in-app title bar that replaces winit's frame under WSL. Drag moves,
+/// double-click maximises, the three buttons do what they say.
+fn wsl_title_bar(ctx: &egui::Context) {
+    egui::TopBottomPanel::top("wsl_titlebar")
+        .exact_height(30.0)
+        .show(ctx, |ui| {
+            let bar = ui.max_rect();
+            // The top edge band belongs to the resize zones, not the drag.
+            let mut drag_rect = bar;
+            drag_rect.min.y += WSL_EDGE;
+            let response = ui.interact(drag_rect, ui.id().with("drag"), Sense::click_and_drag());
+            if response.double_clicked() {
+                let max = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+            } else if response.drag_started_by(egui::PointerButton::Primary) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            ui.painter().text(
+                bar.center(),
+                Align2::CENTER_CENTER,
+                "Claude Session Browser",
+                egui::FontId::proportional(14.0),
+                ui.visuals().strong_text_color(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
+                let max = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                if caption_button(ui, CaptionIcon::Close) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if caption_button(
+                    ui,
+                    if max {
+                        CaptionIcon::Restore
+                    } else {
+                        CaptionIcon::Maximize
+                    },
+                ) {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+                }
+                if caption_button(ui, CaptionIcon::Minimize) {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+            });
+        });
+}
+
+#[derive(Clone, Copy)]
+enum CaptionIcon {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+/// A title-bar button with a painted icon. Text glyphs for these come from
+/// different fonts at different sizes; drawn strokes stay proportional.
+fn caption_button(ui: &mut egui::Ui, icon: CaptionIcon) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 26.0), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        let fill = if matches!(icon, CaptionIcon::Close) {
+            Color32::from_rgb(0xc4, 0x2b, 0x1c)
+        } else {
+            ui.visuals().widgets.hovered.bg_fill
+        };
+        ui.painter().rect_filled(rect, 0.0_f32, fill);
+    }
+    let color = if hovered && matches!(icon, CaptionIcon::Close) {
+        Color32::WHITE
+    } else {
+        ui.visuals().strong_text_color()
+    };
+    let stroke = egui::Stroke::new(1.0_f32, color);
+    let c = rect.center();
+    let r = 5.0; // half-size of the icon box
+    let p = ui.painter();
+    match icon {
+        CaptionIcon::Minimize => {
+            p.line_segment([c + egui::vec2(-r, 0.5), c + egui::vec2(r, 0.5)], stroke);
+        }
+        CaptionIcon::Maximize => {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r)),
+                0.0_f32,
+                stroke,
+            );
+        }
+        CaptionIcon::Restore => {
+            let front = egui::Rect::from_center_size(
+                c + egui::vec2(-1.5, 1.5),
+                egui::vec2(2.0 * r - 3.0, 2.0 * r - 3.0),
+            );
+            p.rect_stroke(front, 0.0_f32, stroke);
+            // The back window: top and right edges peeking out.
+            let tl = front.min + egui::vec2(3.0, -3.0);
+            let tr = tl + egui::vec2(front.width(), 0.0);
+            let br = tr + egui::vec2(0.0, front.height());
+            p.line_segment([tl, tr], stroke);
+            p.line_segment([tr, br], stroke);
+        }
+        CaptionIcon::Close => {
+            p.line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
+            p.line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], stroke);
+        }
+    }
+    response.clicked()
+}
+
+/// Resize zones along the window edges, and a 1px outline so the window has a
+/// visible boundary without a frame. The press is handed to the compositor
+/// (`xdg_toplevel.resize`), which drives the resize itself.
+fn wsl_frame_edges(ctx: &egui::Context) {
+    use egui::ResizeDirection as D;
+    let rect = ctx.screen_rect();
+    let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+        paint_outline(ctx, rect);
+        return;
+    };
+    let west = pos.x < rect.min.x + WSL_EDGE;
+    let east = pos.x > rect.max.x - WSL_EDGE;
+    let north = pos.y < rect.min.y + WSL_EDGE;
+    let south = pos.y > rect.max.y - WSL_EDGE;
+    let dir = match (north, south, west, east) {
+        (true, _, true, _) => Some(D::NorthWest),
+        (true, _, _, true) => Some(D::NorthEast),
+        (_, true, true, _) => Some(D::SouthWest),
+        (_, true, _, true) => Some(D::SouthEast),
+        (true, ..) => Some(D::North),
+        (_, true, ..) => Some(D::South),
+        (_, _, true, _) => Some(D::West),
+        (_, _, _, true) => Some(D::East),
+        _ => None,
+    };
+    // Widgets that reach into the edge band (the caption buttons, the action
+    // bar) keep their clicks: a press a widget has claimed is not a resize.
+    if let Some(dir) = dir.filter(|_| !ctx.is_using_pointer()) {
+        ctx.set_cursor_icon(match dir {
+            D::North | D::South => egui::CursorIcon::ResizeVertical,
+            D::East | D::West => egui::CursorIcon::ResizeHorizontal,
+            D::NorthEast | D::SouthWest => egui::CursorIcon::ResizeNeSw,
+            D::NorthWest | D::SouthEast => egui::CursorIcon::ResizeNwSe,
+        });
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
+    paint_outline(ctx, rect);
+}
+
+fn paint_outline(ctx: &egui::Context, rect: egui::Rect) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("wsl_outline"),
+    ));
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        0.0_f32,
+        egui::Stroke::new(
+            1.0_f32,
+            ctx.style().visuals.widgets.noninteractive.bg_stroke.color,
+        ),
+    );
 }
 
 impl App {
@@ -1167,8 +1393,11 @@ impl App {
                 }
                 ui.add_space(8.0);
 
+                // Bounded by the viewport, or a long list pushes the buttons
+                // off-screen with no way to dismiss the modal.
+                let list_height = (ctx.screen_rect().height() - 180.0).clamp(80.0, 320.0);
                 egui::ScrollArea::vertical()
-                    .max_height(320.0)
+                    .max_height(list_height)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for p in &plans {

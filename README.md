@@ -123,11 +123,12 @@ the version you installed. Running the new installer resyncs it.
 
 The Linux build runs under WSLg, with two adjustments it makes on its own:
 
-- If resizing or snapping the window makes it vanish ("Broken pipe" in the
-  terminal), that is WSLg's Wayland compositor rejecting a frame. `CSB_X11=1 csb`
-  goes through XWayland instead, which does not have the problem but draws a
-  plainer window frame. It needs `libxkbcommon-x11-0` (`sudo apt install
-  libxkbcommon-x11-0`; the .deb/.rpm pull it in).
+- It draws its own title bar and resize edges instead of the usual window
+  frame. WSLg's compositor (Weston 9) segfaults when winit's client-side frame
+  is drag-resized - the window vanishes with "Broken pipe" and every other WSLg
+  window dies with it - while compositor-driven resizes of a frameless window
+  are fine. `CSB_X11=1 csb` is the other way around it: XWayland, with Weston's
+  own plain frame; needs `libxkbcommon-x11-0` (the .deb/.rpm pull it in).
 - WSLg reports 100% scaling whatever Windows is set to, so `csb` reads the
   Windows display scale from the registry (via `reg.exe`) and zooms to match.
   `CSB_SCALE=1.25` (or 1.5, 2) overrides that, e.g. for a non-primary monitor.
