@@ -30,15 +30,17 @@ jobs:
         run: |
           set -euo pipefail
           crate=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          # Plain x.y.z only: the rpm tooling rejects a `-rc.1` suffix and
-          # cargo-deb rewrites it to `~rc.1`, so the install scripts' asset
-          # names would no longer line up.
-          if ! [[ "$crate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "version $crate is not a plain x.y.z release" >&2
-            exit 1
-          fi
-          # workflow_dispatch has no tag, so there is nothing to compare against.
+          # workflow_dispatch has no tag, so there is nothing to compare against, and
+          # it is allowed to build whatever version the tree has - packaging can then
+          # be checked in the middle of a bump.
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # Plain x.y.z only: the rpm tooling rejects a `-rc.1` suffix and cargo-deb
+            # rewrites it to `~rc.1`, so the install scripts' asset names would no
+            # longer line up.
+            if ! [[ "$crate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "version $crate is not a plain x.y.z release" >&2
+              exit 1
+            fi
             tag="${GITHUB_REF_NAME#v}"
             if [[ "$tag" != "$crate" ]]; then
               echo "tag $tag does not match Cargo.toml version $crate" >&2
@@ -46,6 +48,19 @@ jobs:
             fi
           fi
           echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+  # The release build does not run the tests (D7), so the checks run here
+  # instead, at this exact commit. They gate `publish`, not `build`: the two
+  # run side by side, and a failure means the artifacts exist but nothing is
+  # published.
+  #
+  # Tags only. All this job protects is `publish`, and `publish` is itself
+  # tag-only, so on a workflow_dispatch packaging run the matrix would be
+  # three legs guarding nothing. Skipping it here also skips `publish`, which
+  # is what the dispatch wanted anyway.
+  checks:
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/checks.yml
 
   build:
     needs: version
@@ -187,7 +202,7 @@ jobs:
           path: dist/*
 
   publish:
-    needs: [version, build]
+    needs: [version, checks, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
