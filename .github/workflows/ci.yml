@@ -3,11 +3,30 @@ name: CI
 on:
   push:
     branches: [main]
+    # A docs-only push has nothing here to check. Mixed commits still run.
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  # Dependabot is the reason this trigger exists: it pushes to a
+  # `dependabot/**` branch, which the push trigger above deliberately ignores,
+  # so without this its bumps would show no checks at all and a lockfile that
+  # fails `clippy -D warnings` would sail into the next `--locked` release
+  # build. Everyday work goes straight to main, so this seldom fires otherwise.
   pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# One run per ref: pushing again while CI is still going cancels the older run
+# rather than queueing a second 3-OS matrix nobody is waiting for.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -23,7 +42,7 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-22.04]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # eframe with the glow/x11/wayland features. rustls keeps OpenSSL out of
       # it, so there is deliberately no libssl-dev here.
@@ -40,16 +59,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Formatting is platform-independent, so checking it once is enough.
+      # Formatting is platform-independent, so check it once, on the cheapest runner.
       - name: Format
-        if: runner.os == 'Windows'
+        if: runner.os == 'Linux'
         run: cargo fmt --check
 
       # `-D warnings` goes after `--`, not in RUSTFLAGS: as an env var it also
       # applies to every dependency, so one warning in a crate we do not own
       # turns the build red.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
