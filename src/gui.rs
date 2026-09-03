@@ -31,8 +31,12 @@ enum Sort {
 }
 
 /// Smallest window: the two left panels' floors (160 + 260) plus room for a
-/// preview, and enough height for the confirm dialog. Under a maximised,
-/// 150%-scaled 1080p work area.
+/// preview, and enough height for the confirm dialog. Stated once, at build
+/// time, so it lands as physical pixels at WSLg's native 1x and stays there
+/// when the zoom below applies: restating it in points would put the floor at
+/// 1080x720 px under a 150% host - wider than a snapped half of a 1080p
+/// screen, and a minimum the compositor cannot satisfy is what makes it hand
+/// out sizes we then refuse.
 const MIN_WINDOW: [f32; 2] = [720.0, 480.0];
 
 pub fn run(dir: ClaudeDir) -> Result<()> {
@@ -65,21 +69,26 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
     // Wayland the app draws its own title bar and edge zones - see
     // `wsl_title_bar` / `wsl_frame_edges`. XWayland decorates on its own.
     let own_frame = wsl && !x11;
-    let app = App::new(dir, own_frame, x11)?;
 
     // Zoom, not pixels_per_point: it multiplies the native scale, so it keeps
-    // applying if the compositor later reports a real one. The registry value
-    // is only for the WSLg case where the native scale is a flat 1.0 - on top
-    // of a real Xft.dpi it would double-scale.
+    // applying if the compositor later reports a real one. Both sources go
+    // through the same sanity range - a stale `AppliedDPI` of 0x1 would
+    // otherwise shrink the UI past legibility, with no way back but CSB_SCALE.
+    let sane = |z: &f32| (0.5..=4.0).contains(z);
     let explicit = std::env::var("CSB_SCALE")
         .ok()
-        .and_then(|s| s.parse::<f32>().ok());
-    let registry = if own_frame && explicit.is_none() {
-        wsl_host_zoom()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(sane);
+    // Gated on WSL, not on the frame we chose: XWayland under WSLg reports the
+    // same flat 1x, so CSB_X11 needs the registry value just as much. It is
+    // applied on the first frame, once the real native scale is known - see
+    // `pending_zoom`.
+    let registry = if wsl && explicit.is_none() {
+        wsl_host_zoom().filter(sane)
     } else {
         None
     };
-    let zoom = explicit.filter(|z| (0.5..=4.0).contains(z));
+    let app = App::new(dir, own_frame, x11, registry)?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -93,19 +102,9 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
         "Claude Session Browser",
         options,
         Box::new(move |cc| {
-            let native = cc
-                .egui_ctx
-                .input(|i| i.viewport().native_pixels_per_point)
-                .unwrap_or(1.0);
-            let zoom = zoom.or(registry.filter(|_| (native - 1.0).abs() < 0.01));
-            if let Some(z) = zoom {
+            // CSB_SCALE was asked for outright, so it needs no scale check.
+            if let Some(z) = explicit {
                 cc.egui_ctx.set_zoom_factor(z);
-                // The builder's minimum was converted at the native scale;
-                // restate it so it means the same number of points.
-                cc.egui_ctx
-                    .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::Vec2::from(
-                        MIN_WINDOW,
-                    )));
             }
             Ok(Box::new(app))
         }),
@@ -113,8 +112,8 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
     .map_err(|e| {
         if wsl {
             anyhow::anyhow!(
-                "{e}\n\nunder WSL: `CSB_X11=1 csb` avoids WSLg's Wayland resize problem; \
-                 `LIBGL_ALWAYS_SOFTWARE=1 csb` rules out the GPU driver"
+                "{e}\n\nunder WSL: `CSB_X11=1 csb` runs on XWayland instead of WSLg's \
+                 Wayland; `LIBGL_ALWAYS_SOFTWARE=1 csb` rules out the GPU driver"
             )
         } else {
             anyhow::anyhow!("{e}")
@@ -291,10 +290,13 @@ struct App {
     own_frame: bool,
     /// On XWayland under WSL; see the repaint heartbeat in `update`.
     x11: bool,
+    /// The Windows host zoom, waiting for the first frame to say whether the
+    /// compositor reports a scale of its own. Taken once, then `None`.
+    pending_zoom: Option<f32>,
 }
 
 impl App {
-    fn new(dir: ClaudeDir, own_frame: bool, x11: bool) -> Result<Self> {
+    fn new(dir: ClaudeDir, own_frame: bool, x11: bool, pending_zoom: Option<f32>) -> Result<Self> {
         let index = Index::build(&dir)?;
         let mut app = Self {
             dir,
@@ -327,6 +329,7 @@ impl App {
             installed: None,
             own_frame,
             x11,
+            pending_zoom,
         };
         app.status = app.index.warning_summary().unwrap_or_default();
         app.rebuild_projects();
@@ -659,6 +662,18 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The host zoom is for WSLg's flat 1x only: on a compositor that
+        // reports a real scale it would stack on top. The check belongs here,
+        // not in the app creator - there egui's input is still `Default`, so
+        // `native_pixels_per_point` reads `None` whatever the window said.
+        if let Some(z) = self.pending_zoom.take() {
+            let native = ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0);
+            if (native - 1.0).abs() < 0.01 {
+                ctx.set_zoom_factor(z);
+            }
+        }
         self.poll_preview();
         self.poll_update(ctx);
 
@@ -701,11 +716,14 @@ impl eframe::App for App {
 /// Width of the resize zone along the window edge, in points.
 const WSL_EDGE: f32 = 6.0;
 
+/// Height of the in-app title bar, in points.
+const WSL_TITLEBAR: f32 = 30.0;
+
 /// The in-app title bar that replaces winit's frame under WSL. Drag moves,
 /// double-click maximises, the three buttons do what they say.
 fn wsl_title_bar(ctx: &egui::Context) {
     egui::TopBottomPanel::top("wsl_titlebar")
-        .exact_height(30.0)
+        .exact_height(WSL_TITLEBAR)
         .show(ctx, |ui| {
             let bar = ui.max_rect();
             // The top edge band belongs to the resize zones, not the drag.
@@ -1354,16 +1372,23 @@ impl App {
         // Dim everything behind the dialog *and* swallow input aimed at it.
         // Painting alone is not enough: the panels underneath stay live, so the
         // selection could be changed out from under a plan already on screen.
+        let own_frame = self.own_frame;
         egui::Area::new("modal-veil".into())
             .order(egui::Order::Middle)
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
-                let screen = ctx.screen_rect();
+                let mut veil = ctx.screen_rect();
+                // Our own title bar is the only way to move, maximise or close
+                // the window - there is no OS one behind it - so it stays out
+                // of the veil rather than going dead until the dialog closes.
+                if own_frame {
+                    veil.min.y += WSL_TITLEBAR;
+                }
                 ui.painter()
-                    .rect_filled(screen, 0.0, Color32::from_black_alpha(140));
-                // A full-screen interactive widget in a layer above the panels
-                // wins hit-testing, so clicks never reach them.
-                ui.allocate_rect(screen, Sense::click_and_drag());
+                    .rect_filled(veil, 0.0, Color32::from_black_alpha(140));
+                // An interactive widget in a layer above the panels wins
+                // hit-testing, so clicks never reach them.
+                ui.allocate_rect(veil, Sense::click_and_drag());
             });
 
         egui::Window::new("Confirm delete")

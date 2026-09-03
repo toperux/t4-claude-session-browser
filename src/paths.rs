@@ -81,22 +81,31 @@ pub fn is_session_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
 }
 
-/// Running inside Windows Subsystem for Linux. The kernel release names
-/// Microsoft in every WSL1/WSL2 build ("5.15.167.4-microsoft-standard-WSL2"),
-/// unlike the binfmt entry or WSL_DISTRO_NAME, which interop settings, sudo
-/// and systemd services can strip.
+/// Running inside Windows Subsystem for Linux. Three signals, any of which is
+/// enough, because each goes missing on its own: the kernel release names
+/// Microsoft in stock builds ("5.15.167.4-microsoft-standard-WSL2") but not in
+/// a `.wslconfig` `kernel=` one, while the binfmt entry and WSL_DISTRO_NAME
+/// are what interop settings, sudo and systemd services can strip. A missed
+/// "yes" costs the drvfs delete guard, so err towards detecting.
 pub fn is_wsl() -> bool {
     cfg!(target_os = "linux")
-        && std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        && (std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft"))
+            || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+            || std::env::var_os("WSL_DISTRO_NAME").is_some())
 }
 
 /// A path on a Windows drive mounted into WSL. Deleting there goes through
 /// drvfs, where `trash` cannot reach the Windows Recycle Bin. Decided from the
 /// mount table rather than a `/mnt/<letter>` prefix, since `[automount] root`
-/// and manual `mount -t drvfs` put such mounts anywhere.
+/// and manual `mount -t drvfs` put such mounts anywhere. An unreadable
+/// `/proc/mounts` counts as drvfs: of the two guesses, only "not drvfs"
+/// strands files in a `.Trash-<uid>` on `C:`.
 pub fn is_wsl_drvfs(path: &Path) -> bool {
-    std::fs::read_to_string("/proc/mounts").is_ok_and(|m| on_drvfs_mount(path, &m))
+    match std::fs::read_to_string("/proc/mounts") {
+        Ok(mounts) => on_drvfs_mount(path, &mounts),
+        Err(_) => true,
+    }
 }
 
 /// `mounts` is `/proc/mounts`: "<dev> <mountpoint> <fstype> <opts> ...". WSL
