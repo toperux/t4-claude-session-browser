@@ -212,15 +212,27 @@ jobs:
 
   ```sh
   gh api -X PUT repos/toperux/t4-claude-session-browser/vulnerability-alerts
-  gh api -X PUT repos/toperux/t4-claude-session-browser/automated-security-fixes
   ```
 
-  Record below whether they were already on.
+  Record below whether it was already on.
 
-  **Done 2026-09-04. Both were OFF.** `GET repos/.../vulnerability-alerts` returned 404 and
-  `automated-security-fixes` reported `{"enabled":false}`. Both `PUT`s were run; alerts now
-  return 204 and `automated-security-fixes` reports `{"enabled":true,"paused":false}`. See
-  the first item under *Deviations and findings* about what the second one implies.
+- [ ] **Do not enable Dependabot security updates** (`automated-security-fixes`). Alerts
+      notify; security *updates* open pull requests, and after this round nothing runs on
+      `pull_request` in any of the three repos — so such a PR would arrive with no checks at
+      all, which is the exact hole D10 closes. A security fix is the last thing to merge
+      unchecked. When an alert fires, bump it by hand (`cargo update -p <crate>`), push to
+      `main`, and the full matrix runs.
+
+  **Done 2026-09-04. Both were OFF to begin with** — `GET repos/.../vulnerability-alerts`
+  returned 404 and `automated-security-fixes` reported `{"enabled":false}`.
+
+  Both were then briefly enabled, because the first version of this section listed a second
+  `PUT` for `automated-security-fixes` alongside the first. That was flagged as finding 1
+  below, this section was corrected to drop it, and the setting was turned back off with
+  `gh api -X DELETE .../automated-security-fixes`.
+
+  **Final, verified state:** alerts return 204 (on), `automated-security-fixes` reports
+  `{"enabled":false,"paused":false}` (off). That is what this section now asks for.
 
 ## 5. Risks to verify
 
@@ -290,8 +302,9 @@ Still needing a runner:
 - [ ] Confirm no `pull_request` trigger remains in either workflow and `.github/dependabot.yml`
       is gone.
 - [ ] Merge to `main`; CI green on `main`.
-- [x] Dependabot security alerts on for this repo. Were they already on? **No — both were
-      off, and both are on now.** See section 4.
+- [x] Dependabot security alerts on for this repo. Were they already on? **No — they were
+      off, and are on now.** Security *updates* are deliberately off, per section 4. See
+      section 4 for the full sequence.
 
 ## 8. Deviations and findings
 
@@ -302,19 +315,24 @@ Still needing a runner:
 Nothing in sections 1–4 was changed, added to, or skipped. The two workflows and the deleted
 file match the plan exactly. Four findings, none acted on beyond this repo:
 
-1. **D10's "no PRs" rationale does not survive the second command it prescribes.** The
-   decision drops Dependabot because "its only output is PRs" and keeps security alerts as
-   "a repo setting, no config file, no PRs, no Actions minutes". That is true of
-   `vulnerability-alerts`, which only raises alerts. It is **not** true of
-   `automated-security-fixes`: that is Dependabot security updates, and it opens PRs — the
-   same `dependabot/**` branches D10 is removing the trigger for. Section 4 told me to enable
-   both, so I did, but the result is that this repo can now receive PRs that no workflow
-   checks, which is the exact hole round 2 exists to close. It is a much narrower hole than
-   round 1's (only a real CVE opens one, and it is a merge nobody should be doing blind
-   anyway), so it may well be the right trade. But the master pass should decide it on
-   purpose: either enable `vulnerability-alerts` alone and get genuinely PR-free alerting, or
-   keep both and drop the "no PRs" clause from D10's wording. Whichever way it goes, all
-   three repos should match — the same two commands are in all three plans.
+1. **D10's "no PRs" rationale did not survive the second command it prescribed — now
+   resolved, and the other two repos still need it.** The decision drops Dependabot because
+   "its only output is PRs" and keeps security alerts as "a repo setting, no config file, no
+   PRs, no Actions minutes". That is true of `vulnerability-alerts`, which only raises
+   alerts. It is **not** true of `automated-security-fixes`: that is Dependabot security
+   updates, and it opens PRs — on the same `dependabot/**` branches D10 removes the trigger
+   for. Section 4 originally listed both `PUT`s, so both were enabled, which left this repo
+   able to receive PRs that no workflow checks: the exact hole round 2 exists to close.
+
+   **Resolved 2026-09-04.** Section 4 has been rewritten to enable alerts only and to say
+   explicitly not to enable security updates, and `automated-security-fixes` was turned back
+   off here. Alerts on, updates off, verified.
+
+   **Still outstanding for the master pass:** the same two `PUT`s appear in the mdv and
+   git-ui plans, so both should be corrected the same way, and any repo where
+   `automated-security-fixes` was already enabled needs the `DELETE`. Worth checking rather
+   than assuming — it was off in this repo before round 2, so it may never have been on
+   anywhere.
 2. **Alerts were off here, as suspected.** Both endpoints were disabled before this pass, so
    that is two of three repos found off (git-ui on 2026-09-03, csb now). mdv is worth
    checking; if it is off too, the finding is that the setting has never been on anywhere,
