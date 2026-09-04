@@ -1,20 +1,12 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, Local, Utc};
 use serde_json::json;
-use std::cmp::Reverse;
 use std::io::{BufRead, Write};
 
 use crate::del::{self, human_bytes};
-use crate::index::{Index, SessionMeta};
+use crate::index::{Index, SessionMeta, Sort};
 use crate::paths::ClaudeDir;
 use crate::transcript::{self, Event, LoadOpts};
-
-#[derive(Clone, Copy, clap::ValueEnum)]
-pub enum Sort {
-    Date,
-    Size,
-    Msgs,
-}
 
 // Table headers stay as args so they share the row format string's width specs.
 #[allow(clippy::print_literal)]
@@ -24,12 +16,7 @@ pub fn list(index: &Index, project: Option<&str>, sort: Sort, as_json: bool) -> 
         .iter()
         .filter(|s| matches_project(s, project))
         .collect();
-
-    match sort {
-        Sort::Date => sessions.sort_by_key(|s| Reverse(s.activity())),
-        Sort::Size => sessions.sort_by_key(|s| Reverse(s.size_bytes)),
-        Sort::Msgs => sessions.sort_by_key(|s| Reverse(s.user_msgs + s.assistant_msgs)),
-    }
+    sort.apply(&mut sessions);
 
     if as_json {
         let rows: Vec<_> = sessions
@@ -96,8 +83,8 @@ pub fn projects(index: &Index) -> Result<()> {
     for p in &projects {
         println!(
             "{:<6}  {:>9}  {:<40}  {}",
-            p.sessions.len(),
-            human_bytes(p.size_bytes()),
+            p.count,
+            human_bytes(p.bytes),
             crate::index::truncate(&p.slug, 40),
             p.label,
         );
@@ -138,7 +125,6 @@ pub fn show(index: &Index, needle: &str, raw: bool, sidechains: bool) -> Result<
     let opts = LoadOpts {
         max_entries: usize::MAX,
         include_sidechains: sidechains,
-        include_meta: false,
     };
     let t = transcript::load(&meta.path, &opts)?;
     let stdout = std::io::stdout();
@@ -164,7 +150,6 @@ pub fn show(index: &Index, needle: &str, raw: bool, sidechains: bool) -> Result<
                     crate::index::truncate(preview, 160)
                 )?
             }
-            Event::Meta(label) => writeln!(out, "{marker}  . {label}")?,
         }
     }
     Ok(())

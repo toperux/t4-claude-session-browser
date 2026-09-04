@@ -8,11 +8,10 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use std::cmp::Reverse;
 use std::collections::HashSet;
 
 use crate::del::{self, human_bytes};
-use crate::index::{truncate, Index, SessionMeta};
+use crate::index::{truncate, Index, Project, SessionMeta, Sort};
 use crate::paths::ClaudeDir;
 use crate::transcript::{self, Entry, Event, LoadOpts};
 
@@ -23,27 +22,19 @@ enum Pane {
     Preview,
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum Sort {
-    Date,
-    Size,
-    Msgs,
+fn next_sort(sort: Sort) -> Sort {
+    match sort {
+        Sort::Date => Sort::Size,
+        Sort::Size => Sort::Msgs,
+        Sort::Msgs => Sort::Date,
+    }
 }
 
-impl Sort {
-    fn next(self) -> Self {
-        match self {
-            Sort::Date => Sort::Size,
-            Sort::Size => Sort::Msgs,
-            Sort::Msgs => Sort::Date,
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Sort::Date => "date",
-            Sort::Size => "size",
-            Sort::Msgs => "msgs",
-        }
+fn sort_label(sort: Sort) -> &'static str {
+    match sort {
+        Sort::Date => "date",
+        Sort::Size => "size",
+        Sort::Msgs => "msgs",
     }
 }
 
@@ -56,8 +47,8 @@ enum Mode {
 struct App {
     dir: ClaudeDir,
     index: Index,
-    /// Project slugs; index 0 is the "all projects" pseudo-entry.
-    project_rows: Vec<(Option<String>, String, usize, u64)>,
+    project_rows: Vec<Project>,
+    /// 0 is the "all projects" row; `n` is `project_rows[n - 1]`.
     project_sel: usize,
     visible: Vec<SessionMeta>,
     session_sel: usize,
@@ -102,53 +93,19 @@ impl App {
     }
 
     fn rebuild_projects(&mut self) {
-        let total_bytes = self.index.sessions.iter().map(|s| s.size_bytes).sum();
-        let mut rows = vec![(
-            None,
-            format!("All projects ({})", self.index.sessions.len()),
-            self.index.sessions.len(),
-            total_bytes,
-        )];
-        for p in self.index.projects() {
-            rows.push((
-                Some(p.slug.clone()),
-                p.label.clone(),
-                p.sessions.len(),
-                p.size_bytes(),
-            ));
-        }
-        self.project_rows = rows;
-        self.project_sel = self.project_sel.min(self.project_rows.len() - 1);
+        self.project_rows = self.index.projects();
+        self.project_sel = self.project_sel.min(self.project_rows.len());
+    }
+
+    fn selected_slug(&self) -> Option<&str> {
+        let p = self.project_rows.get(self.project_sel.checked_sub(1)?)?;
+        Some(&p.slug)
     }
 
     fn refilter(&mut self) {
-        let slug = self
-            .project_rows
-            .get(self.project_sel)
-            .and_then(|r| r.0.clone());
-        let needle = self.filter.to_lowercase();
-
-        let mut list: Vec<SessionMeta> = self
+        self.visible = self
             .index
-            .sessions
-            .iter()
-            .filter(|s| slug.as_ref().is_none_or(|sl| &s.project_slug == sl))
-            .filter(|s| {
-                needle.is_empty()
-                    || s.title.to_lowercase().contains(&needle)
-                    || s.location().to_lowercase().contains(&needle)
-                    || s.id.starts_with(&needle)
-            })
-            .cloned()
-            .collect();
-
-        match self.sort {
-            Sort::Date => list.sort_by_key(|s| Reverse(s.activity())),
-            Sort::Size => list.sort_by_key(|s| Reverse(s.size_bytes)),
-            Sort::Msgs => list.sort_by_key(|s| Reverse(s.user_msgs + s.assistant_msgs)),
-        }
-
-        self.visible = list;
+            .filter(self.selected_slug(), &self.filter, self.sort);
         self.session_sel = self.session_sel.min(self.visible.len().saturating_sub(1));
         self.load_preview();
     }
@@ -205,19 +162,6 @@ impl App {
     /// too much rather than scrolling into an empty pane.
     fn max_scroll(&self) -> u16 {
         u16::try_from(self.preview.len().saturating_sub(1)).unwrap_or(u16::MAX)
-    }
-
-    /// Marked sessions, or the highlighted one when nothing is marked.
-    fn delete_targets(&self) -> Vec<SessionMeta> {
-        if self.marked.is_empty() {
-            return self.current().cloned().into_iter().collect();
-        }
-        self.index
-            .sessions
-            .iter()
-            .filter(|s| self.marked.contains(&s.id))
-            .cloned()
-            .collect()
     }
 
     fn reload_index(&mut self) -> Result<()> {
@@ -363,7 +307,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.focus = Pane::Sessions;
         }
         KeyCode::Char('s') => {
-            app.sort = app.sort.next();
+            app.sort = next_sort(app.sort);
             app.refilter();
         }
         KeyCode::Char('r') => {
@@ -396,7 +340,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('A') => app.marked.clear(),
         KeyCode::Char('d') => {
-            let targets = app.delete_targets();
+            let targets = app.index.marked_or(&app.marked, app.current());
             if targets.is_empty() {
                 app.status = "nothing selected".into();
             } else {
@@ -423,7 +367,7 @@ fn move_sel(app: &mut App, delta: i32) {
     };
     match app.focus {
         Pane::Projects => {
-            let next = step(app.project_sel, app.project_rows.len());
+            let next = step(app.project_sel, app.project_rows.len() + 1);
             if next != app.project_sel {
                 app.project_sel = next;
                 app.session_sel = 0;
@@ -447,7 +391,7 @@ fn move_sel(app: &mut App, delta: i32) {
 fn jump(app: &mut App, top: bool) {
     match app.focus {
         Pane::Projects => {
-            app.project_sel = if top { 0 } else { app.project_rows.len() - 1 };
+            app.project_sel = if top { 0 } else { app.project_rows.len() };
             app.session_sel = 0;
             app.refilter();
         }
@@ -497,14 +441,23 @@ fn pane_block(title: &str, focused: bool) -> Block<'static> {
 }
 
 fn draw_projects(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
+    let all_label = format!("All projects ({})", app.index.sessions.len());
+    let all = (
+        all_label.as_str(),
+        app.index.sessions.len(),
+        app.index.sessions.iter().map(|s| s.size_bytes).sum::<u64>(),
+    );
+    let rows = app
         .project_rows
         .iter()
-        .map(|(_, label, count, bytes)| {
+        .map(|p| (p.label.as_str(), p.count, p.bytes));
+    let items: Vec<ListItem> = std::iter::once(all)
+        .chain(rows)
+        .map(|(label, count, bytes)| {
             ListItem::new(vec![
                 Line::from(truncate(label, area.width.saturating_sub(4) as usize)),
                 Line::from(Span::styled(
-                    format!("  {count} sessions · {}", human_bytes(*bytes)),
+                    format!("  {count} sessions · {}", human_bytes(bytes)),
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -553,7 +506,7 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(
         "Sessions ({}) · sort:{}{}",
         app.visible.len(),
-        app.sort.label(),
+        sort_label(app.sort),
         if app.filter.is_empty() {
             String::new()
         } else {
@@ -648,7 +601,6 @@ fn entry_lines(entry: &Entry) -> Vec<Line<'static>> {
                 style,
             ))]
         }
-        Event::Meta(label) => vec![Line::from(Span::styled(format!("· {label}"), dim))],
     }
 }
 

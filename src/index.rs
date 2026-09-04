@@ -3,8 +3,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use memchr::memmem;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -77,18 +78,34 @@ impl SessionMeta {
     }
 }
 
-/// One project directory plus the sessions inside it.
+/// Session orderings; every one is descending.
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum Sort {
+    Date,
+    Size,
+    Msgs,
+}
+
+impl Sort {
+    pub fn apply<S: Borrow<SessionMeta>>(self, list: &mut [S]) {
+        match self {
+            Sort::Date => list.sort_by_key(|s| Reverse(s.borrow().activity())),
+            Sort::Size => list.sort_by_key(|s| Reverse(s.borrow().size_bytes)),
+            Sort::Msgs => {
+                list.sort_by_key(|s| Reverse(s.borrow().user_msgs + s.borrow().assistant_msgs))
+            }
+        }
+    }
+}
+
+/// One project directory, summarised.
 #[derive(Debug, Clone)]
 pub struct Project {
     pub slug: String,
+    /// The recorded `cwd`, else the slug (see `SessionMeta::location`).
     pub label: String,
-    pub sessions: Vec<SessionMeta>,
-}
-
-impl Project {
-    pub fn size_bytes(&self) -> u64 {
-        self.sessions.iter().map(|s| s.size_bytes).sum()
-    }
+    pub count: usize,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -145,28 +162,70 @@ impl Index {
         })
     }
 
-    /// Sessions grouped by project, newest project first.
+    /// Projects, newest first. `sessions` is already newest-first, so the order
+    /// each slug is first seen in is the order wanted.
     pub fn projects(&self) -> Vec<Project> {
-        let mut by_slug: HashMap<&str, Vec<SessionMeta>> = HashMap::new();
+        let mut out: Vec<Project> = Vec::new();
+        let mut at: HashMap<&str, usize> = HashMap::new();
         for s in &self.sessions {
-            by_slug.entry(&s.project_slug).or_default().push(s.clone());
+            let i = *at.entry(&s.project_slug).or_insert_with(|| {
+                out.push(Project {
+                    slug: s.project_slug.clone(),
+                    label: String::new(),
+                    count: 0,
+                    bytes: 0,
+                });
+                out.len() - 1
+            });
+            let p = &mut out[i];
+            p.count += 1;
+            p.bytes += s.size_bytes;
+            if p.label.is_empty() {
+                p.label = s.cwd.clone().unwrap_or_default();
+            }
         }
-        let mut out: Vec<Project> = by_slug
-            .into_iter()
-            .map(|(slug, sessions)| {
-                let label = sessions
-                    .iter()
-                    .find_map(|s| s.cwd.clone())
-                    .unwrap_or_else(|| slug.to_string());
-                Project {
-                    slug: slug.to_string(),
-                    label,
-                    sessions,
-                }
-            })
-            .collect();
-        out.sort_by_key(|p| Reverse(p.sessions.first().map(|s| s.activity())));
+        for p in &mut out {
+            if p.label.is_empty() {
+                p.label = p.slug.clone();
+            }
+        }
         out
+    }
+
+    /// Sessions in project `slug` (all when `None`) whose title, location or
+    /// id prefix contains `needle`, sorted.
+    pub fn filter(&self, slug: Option<&str>, needle: &str, sort: Sort) -> Vec<SessionMeta> {
+        let needle = needle.to_lowercase();
+        let mut list: Vec<SessionMeta> = self
+            .sessions
+            .iter()
+            .filter(|s| slug.is_none_or(|sl| s.project_slug == sl))
+            .filter(|s| {
+                needle.is_empty()
+                    || s.title.to_lowercase().contains(&needle)
+                    || s.location().to_lowercase().contains(&needle)
+                    || s.id.starts_with(&needle)
+            })
+            .cloned()
+            .collect();
+        sort.apply(&mut list);
+        list
+    }
+
+    /// The `marked` sessions, or `fallback` alone when nothing is marked.
+    pub fn marked_or(
+        &self,
+        marked: &HashSet<String>,
+        fallback: Option<&SessionMeta>,
+    ) -> Vec<SessionMeta> {
+        if marked.is_empty() {
+            return fallback.cloned().into_iter().collect();
+        }
+        self.sessions
+            .iter()
+            .filter(|s| marked.contains(&s.id))
+            .cloned()
+            .collect()
     }
 
     /// Resolve a full id or unique id prefix.
@@ -663,6 +722,47 @@ mod tests {
 
         let meta = scan_file("slug", &path, 40, 0).unwrap();
         assert_eq!(meta.title, "(untitled セッション記録)");
+    }
+
+    #[test]
+    fn projects_summarise_in_session_order() {
+        let meta = |slug: &str, cwd: Option<&str>, bytes: u64| SessionMeta {
+            id: String::new(),
+            path: PathBuf::new(),
+            project_slug: slug.into(),
+            size_bytes: bytes,
+            modified_ms: 0,
+            first_ts: None,
+            last_ts: None,
+            title: String::new(),
+            cwd: cwd.map(str::to_string),
+            git_branch: None,
+            user_msgs: 0,
+            assistant_msgs: 0,
+            tool_calls: 0,
+        };
+        // Newest first, as `build` leaves them.
+        let index = Index {
+            sessions: vec![
+                meta("b", None, 1),
+                meta("a", Some("/src/a"), 10),
+                meta("b", Some("/src/b"), 2),
+                meta("a", Some("/elsewhere"), 100),
+            ],
+            warnings: Vec::new(),
+        };
+        let p = index.projects();
+        let rows: Vec<(&str, &str, usize, u64)> = p
+            .iter()
+            .map(|p| (p.slug.as_str(), p.label.as_str(), p.count, p.bytes))
+            .collect();
+        // Label is the first recorded cwd; a slug with none shows as itself.
+        assert_eq!(rows, [("b", "/src/b", 2, 3), ("a", "/src/a", 2, 110)]);
+        let none = Index {
+            sessions: vec![meta("c", None, 0)],
+            warnings: Vec::new(),
+        };
+        assert_eq!(none.projects()[0].label, "c");
     }
 
     /// A file whose mtime is far outside chrono's range must not panic the

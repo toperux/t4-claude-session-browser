@@ -22,14 +22,13 @@ pub enum Event {
         preview: String,
         raw: String,
     },
-    Meta(String),
 }
 
 impl Event {
     /// Text used for in-session search.
     pub fn searchable(&self) -> &str {
         match self {
-            Event::User(t) | Event::Assistant(t) | Event::Thinking(t) | Event::Meta(t) => t,
+            Event::User(t) | Event::Assistant(t) | Event::Thinking(t) => t,
             Event::ToolUse { headline, .. } => headline,
             Event::ToolResult { preview, .. } => preview,
         }
@@ -47,7 +46,6 @@ pub struct Entry {
 pub struct LoadOpts {
     pub max_entries: usize,
     pub include_sidechains: bool,
-    pub include_meta: bool,
 }
 
 impl Default for LoadOpts {
@@ -55,7 +53,6 @@ impl Default for LoadOpts {
         Self {
             max_entries: 2000,
             include_sidechains: false,
-            include_meta: false,
         }
     }
 }
@@ -89,10 +86,7 @@ pub fn load(path: &Path, opts: &LoadOpts) -> Result<Transcript> {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Utc));
 
-        let events = events_from(&v)
-            .into_iter()
-            .filter(|e| opts.include_meta || !matches!(e, Event::Meta(_)));
-        for event in events {
+        for event in events_from(&v) {
             // Checked per event, not per line: a trailing line that yields
             // nothing must not report the transcript as cut short.
             if out.entries.len() >= opts.max_entries {
@@ -109,26 +103,13 @@ pub fn load(path: &Path, opts: &LoadOpts) -> Result<Transcript> {
     Ok(out)
 }
 
-/// Meta events are produced unconditionally; `load` drops them when they are
-/// not wanted, so every source of them is filtered in one place.
+/// Only message records carry anything worth showing; `system`, `attachment`,
+/// `mode` and the rest are CLI bookkeeping.
 fn events_from(v: &Value) -> Vec<Event> {
     match v["type"].as_str().unwrap_or("") {
         "user" => blocks_of(&v["message"]["content"], false),
         "assistant" => blocks_of(&v["message"]["content"], true),
-        "system" => {
-            let subtype = v["subtype"].as_str().unwrap_or("system");
-            let body = v["content"].as_str().unwrap_or("");
-            vec![Event::Meta(format!(
-                "system/{subtype} {}",
-                truncate(body, 200)
-            ))]
-        }
-        "attachment" => {
-            let kind = v["attachment"]["type"].as_str().unwrap_or("attachment");
-            vec![Event::Meta(format!("attachment: {kind}"))]
-        }
-        "" => Vec::new(),
-        other => vec![Event::Meta(other.to_string())],
+        _ => Vec::new(),
     }
 }
 
@@ -187,11 +168,10 @@ fn blocks_of(content: &Value, assistant: bool) -> Vec<Event> {
 
 /// Every session opens with CLI-generated wrappers - a slash command, a caveat
 /// about local commands, injected reminders. Rendering those as user turns
-/// buries the real prompt, so collapse them to one meta line (or drop them).
+/// buries the real prompt, so drop them.
 fn user_text(text: &str) -> Option<Event> {
-    if let Some(name) = crate::index::tag_value(text, "command-name") {
-        let args = crate::index::tag_value(text, "command-args").unwrap_or_default();
-        return Some(Event::Meta(truncate(format!("{name} {args}").trim(), 200)));
+    if crate::index::tag_value(text, "command-name").is_some() {
+        return None;
     }
     let stripped = crate::index::strip_noise_tags(text);
     let stripped = stripped.trim();
@@ -257,7 +237,6 @@ mod tests {
             Event::Thinking(_) => "thinking",
             Event::ToolUse { .. } => "tool",
             Event::ToolResult { .. } => "result",
-            Event::Meta(_) => "meta",
         }
     }
 
@@ -265,7 +244,6 @@ mod tests {
         LoadOpts {
             max_entries: usize::MAX,
             include_sidechains: true,
-            include_meta: true,
         }
     }
 
@@ -293,7 +271,7 @@ mod tests {
         assert_eq!(
             roles,
             ["user", "thinking", "assistant", "tool", "result"],
-            "meta records excluded by default; bad lines skipped"
+            "non-message records and bad lines skipped"
         );
 
         match &t.entries[3].event {
@@ -315,20 +293,13 @@ mod tests {
             r#"{"type":"user","message":{"content":"<system-reminder>noise</system-reminder>the real prompt"}}"#,
         ]);
 
-        // Meta is off by default, so only the real prompt survives...
         let t = load(f.path(), &LoadOpts::default()).unwrap();
-        assert_eq!(t.entries.len(), 1);
+        assert_eq!(t.entries.len(), 1, "caveat and command dropped");
         assert!(matches!(&t.entries[0].event, Event::User(s) if s == "the real prompt"));
-
-        // ...and the command shows as one meta line when meta is on.
-        let t = load(f.path(), &everything()).unwrap();
-        let roles: Vec<&str> = t.entries.iter().map(|e| role(&e.event)).collect();
-        assert_eq!(roles, ["meta", "user"], "caveat dropped, command collapsed");
-        assert!(matches!(&t.entries[0].event, Event::Meta(s) if s == "/clear"));
     }
 
     #[test]
-    fn sidechains_and_meta_are_opt_in() {
+    fn sidechains_are_opt_in() {
         let f = fixture(&[
             r#"{"type":"mode","mode":"normal"}"#,
             r#"{"type":"user","isSidechain":true,"message":{"content":"hidden"}}"#,
@@ -337,7 +308,7 @@ mod tests {
             .unwrap()
             .entries
             .is_empty());
-        assert_eq!(load(f.path(), &everything()).unwrap().entries.len(), 2);
+        assert_eq!(load(f.path(), &everything()).unwrap().entries.len(), 1);
     }
 
     #[test]

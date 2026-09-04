@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use claude_session_browser::index::Index;
+use claude_session_browser::index::{Index, Sort};
 use claude_session_browser::paths::ClaudeDir;
 use claude_session_browser::{cli, gui, tui};
 
@@ -30,7 +30,7 @@ enum Cmd {
         #[arg(long, short)]
         project: Option<String>,
         #[arg(long, value_enum, default_value = "date")]
-        sort: cli::Sort,
+        sort: Sort,
         #[arg(long)]
         json: bool,
     },

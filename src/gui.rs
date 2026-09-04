@@ -1,12 +1,11 @@
 use anyhow::Result;
 use chrono::Local;
 use eframe::egui::{self, Align2, Color32, RichText, Sense};
-use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver};
 
 use crate::del::{self, human_bytes, DeletePlan};
-use crate::index::{truncate, Index, SessionMeta};
+use crate::index::{truncate, Index, Project, SessionMeta, Sort};
 use crate::paths::ClaudeDir;
 use crate::transcript::{self, Entry, Event, LoadOpts, Transcript};
 use crate::update::Available;
@@ -22,13 +21,6 @@ const PAGE: usize = 300;
 
 /// Vertical padding inside a session row; part of the fixed row height.
 const ROW_MARGIN_Y: f32 = 5.0;
-
-#[derive(PartialEq, Clone, Copy)]
-enum Sort {
-    Date,
-    Size,
-    Msgs,
-}
 
 /// Smallest window: the two left panels' floors (160 + 260) plus room for a
 /// preview, and enough height for the confirm dialog. Stated once, at build
@@ -234,19 +226,11 @@ struct PendingPreview {
     rx: Receiver<Result<Transcript, String>>,
 }
 
-/// Precomputed sidebar row. Rebuilding these per frame meant cloning every
-/// `SessionMeta` on every repaint.
-struct ProjectRow {
-    slug: String,
-    label: String,
-    count: usize,
-    bytes: u64,
-}
-
 struct App {
     dir: ClaudeDir,
     index: Index,
-    project_rows: Vec<ProjectRow>,
+    /// Rebuilt with the index, not per frame.
+    project_rows: Vec<Project>,
 
     project_filter: Option<String>,
     search: String,
@@ -338,45 +322,13 @@ impl App {
     }
 
     fn rebuild_projects(&mut self) {
-        self.project_rows = self
-            .index
-            .projects()
-            .into_iter()
-            .map(|p| ProjectRow {
-                count: p.sessions.len(),
-                bytes: p.size_bytes(),
-                slug: p.slug,
-                label: p.label,
-            })
-            .collect();
+        self.project_rows = self.index.projects();
     }
 
     fn refilter(&mut self) {
-        let needle = self.search.to_lowercase();
-        let mut list: Vec<SessionMeta> = self
+        self.visible = self
             .index
-            .sessions
-            .iter()
-            .filter(|s| {
-                self.project_filter
-                    .as_ref()
-                    .is_none_or(|slug| &s.project_slug == slug)
-            })
-            .filter(|s| {
-                needle.is_empty()
-                    || s.title.to_lowercase().contains(&needle)
-                    || s.location().to_lowercase().contains(&needle)
-                    || s.id.starts_with(&needle)
-            })
-            .cloned()
-            .collect();
-
-        match self.sort {
-            Sort::Date => list.sort_by_key(|s| Reverse(s.activity())),
-            Sort::Size => list.sort_by_key(|s| Reverse(s.size_bytes)),
-            Sort::Msgs => list.sort_by_key(|s| Reverse(s.user_msgs + s.assistant_msgs)),
-        }
-        self.visible = list;
+            .filter(self.project_filter.as_deref(), &self.search, self.sort);
         self.anchor = None;
     }
 
@@ -581,23 +533,9 @@ impl App {
         self.index.sessions.iter().find(|s| &s.id == id)
     }
 
-    /// Marked sessions, or the focused one when nothing is marked. Clones, so
-    /// call it when acting - not to render a label every frame.
-    fn delete_targets(&self) -> Vec<SessionMeta> {
-        if self.marked.is_empty() {
-            return self.focused_meta().cloned().into_iter().collect();
-        }
-        self.index
-            .sessions
-            .iter()
-            .filter(|s| self.marked.contains(&s.id))
-            .cloned()
-            .collect()
-    }
-
-    /// Count and size of what `delete_targets` would return, without cloning.
-    /// Must mirror its selection rule exactly, or the button and the action
-    /// would disagree.
+    /// Count and size of what `Index::marked_or` would return, without
+    /// cloning. Must mirror its selection rule exactly, or the button and the
+    /// action would disagree.
     fn selection_summary(&self) -> (usize, u64) {
         if self.marked.is_empty() {
             return match self.focused_meta() {
@@ -629,7 +567,6 @@ impl App {
                     self.preview = None;
                     self.preview_error = None;
                 }
-                drop(alive);
                 self.rebuild_projects();
                 self.refilter();
             }
@@ -1354,7 +1291,7 @@ impl App {
                     .add_enabled(count > 0, egui::Button::new(RichText::new(text).strong()))
                     .clicked()
                 {
-                    let targets = self.delete_targets();
+                    let targets = self.index.marked_or(&self.marked, self.focused_meta());
                     self.confirm = Some(targets.iter().map(|m| del::plan(&self.dir, m)).collect());
                 }
                 ui.label(RichText::new("goes to the recycle bin").small().weak());
@@ -1552,9 +1489,6 @@ fn draw_entry(ui: &mut egui::Ui, entry: &Entry) {
             .show(ui, |ui| {
                 ui.label(RichText::new(truncate(raw, 20_000)).monospace().small());
             });
-        }
-        Event::Meta(label) => {
-            ui.label(RichText::new(format!("· {label}")).small().weak());
         }
     }
 }
