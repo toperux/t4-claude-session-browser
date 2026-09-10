@@ -1,0 +1,6 @@
+# Generated release notes list merged PRs; Dependabot labels its bumps
+# `dependencies`, so this keeps them off the release page.
+changelog:
+  exclude:
+    labels:
+      - dependencies
