@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
 use crate::index::SessionMeta;
@@ -31,6 +31,63 @@ pub fn plan(dir: &ClaudeDir, meta: &SessionMeta) -> DeletePlan {
         paths,
         bytes,
         recent: meta.is_recent(),
+    }
+}
+
+/// What a confirm dialog needs to say about a batch of plans.
+pub struct PlanSummary {
+    pub bytes: u64,
+    pub files: usize,
+    pub live: usize,
+}
+
+pub fn summarize(plans: &[DeletePlan]) -> PlanSummary {
+    PlanSummary {
+        bytes: plans.iter().map(|p| p.bytes).sum(),
+        files: plans.iter().map(|p| p.paths.len()).sum(),
+        live: plans.iter().filter(|p| p.recent).count(),
+    }
+}
+
+/// How a batch of plans ended: how many were trashed, and what stopped it.
+pub struct Outcome {
+    pub ok: usize,
+    pub total: usize,
+    pub failed: Option<anyhow::Error>,
+}
+
+impl Outcome {
+    /// The only place either wording lives, so all three front ends agree.
+    pub fn summary(&self, bytes: u64) -> String {
+        match &self.failed {
+            Some(e) => format!("deleted {} of {}, then failed: {e:#}", self.ok, self.total),
+            None => format!(
+                "moved {} session(s) ({}) to the recycle bin",
+                self.ok,
+                human_bytes(bytes)
+            ),
+        }
+    }
+}
+
+/// Run every plan in order and stop at the first failure, so what was already
+/// trashed is never lost track of.
+pub fn execute_all(dir: &ClaudeDir, plans: &[DeletePlan]) -> Outcome {
+    let mut ok = 0;
+    for p in plans {
+        if let Err(e) = execute(dir, p).with_context(|| format!("deleting session {}", p.id)) {
+            return Outcome {
+                ok,
+                total: plans.len(),
+                failed: Some(e),
+            };
+        }
+        ok += 1;
+    }
+    Outcome {
+        ok,
+        total: plans.len(),
+        failed: None,
     }
 }
 
@@ -137,6 +194,77 @@ mod tests {
             recent: false,
         };
         assert!(execute(&dir, &plan).is_err());
+    }
+
+    // The refused plan goes first so the test never reaches the OS recycle
+    // bin, which is not something a headless CI runner reliably has.
+    #[test]
+    fn execute_all_stops_at_the_first_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("claude");
+        std::fs::create_dir_all(root.join("projects")).unwrap();
+        let dir = ClaudeDir::resolve(Some(&root)).unwrap();
+
+        let outside = tmp.path().join("precious.txt");
+        std::fs::write(&outside, "keep me").unwrap();
+        let inside = root.join("projects").join("a.jsonl");
+        std::fs::write(&inside, "still here").unwrap();
+
+        let plans = vec![
+            DeletePlan {
+                id: "a".into(),
+                title: "a".into(),
+                paths: vec![outside.clone()],
+                bytes: 0,
+                recent: false,
+            },
+            DeletePlan {
+                id: "b".into(),
+                title: "b".into(),
+                paths: vec![inside.clone()],
+                bytes: 10,
+                recent: false,
+            },
+        ];
+
+        let outcome = execute_all(&dir, &plans);
+        assert_eq!(outcome.ok, 0);
+        assert_eq!(outcome.total, 2);
+        assert!(outcome.failed.is_some());
+        assert!(
+            outcome
+                .summary(10)
+                .starts_with("deleted 0 of 2, then failed"),
+            "{}",
+            outcome.summary(10)
+        );
+        assert!(outside.exists(), "the refused plan must not be touched");
+        assert!(inside.exists(), "the plan after the failure must not run");
+    }
+
+    #[test]
+    fn summarize_adds_up_every_plan() {
+        let plans = vec![
+            DeletePlan {
+                id: "a".into(),
+                title: "a".into(),
+                paths: vec!["one".into(), "two".into()],
+                bytes: 100,
+                recent: true,
+            },
+            DeletePlan {
+                id: "b".into(),
+                title: "b".into(),
+                paths: vec!["three".into()],
+                bytes: 20,
+                recent: false,
+            },
+        ];
+
+        let s = summarize(&plans);
+        assert_eq!(s.bytes, 120);
+        assert_eq!(s.files, 3);
+        assert_eq!(s.live, 1);
     }
 
     #[test]

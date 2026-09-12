@@ -4,7 +4,7 @@ use eframe::egui::{self, Align2, Color32, RichText, Sense};
 use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver};
 
-use crate::del::{self, human_bytes, DeletePlan};
+use crate::del::{self, human_bytes, DeletePlan, PlanSummary};
 use crate::index::{truncate, Index, Project, SessionMeta, Sort};
 use crate::paths::ClaudeDir;
 use crate::transcript::{self, Entry, Event, LoadOpts, Transcript};
@@ -575,23 +575,8 @@ impl App {
     }
 
     fn run_delete(&mut self, plans: &[DeletePlan]) {
-        let mut ok = 0;
-        for p in plans {
-            match del::execute(&self.dir, p) {
-                Ok(()) => ok += 1,
-                Err(e) => {
-                    self.status = format!("deleted {ok}, then failed: {e}");
-                    self.marked.clear();
-                    self.reindex();
-                    return;
-                }
-            }
-        }
-        let bytes: u64 = plans.iter().map(|p| p.bytes).sum();
-        self.status = format!(
-            "moved {ok} session(s) ({}) to the recycle bin",
-            human_bytes(bytes)
-        );
+        let outcome = del::execute_all(&self.dir, plans);
+        self.status = outcome.summary(del::summarize(plans).bytes);
         self.marked.clear();
         self.reindex();
     }
@@ -850,16 +835,12 @@ impl App {
             ui.label("Sort");
             let mut sort = self.sort;
             egui::ComboBox::from_id_salt("sort")
-                .selected_text(match sort {
-                    Sort::Date => "recent",
-                    Sort::Size => "size",
-                    Sort::Msgs => "messages",
-                })
+                .selected_text(sort.label())
                 .width(110.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut sort, Sort::Date, "recent");
-                    ui.selectable_value(&mut sort, Sort::Size, "size");
-                    ui.selectable_value(&mut sort, Sort::Msgs, "messages");
+                    ui.selectable_value(&mut sort, Sort::Date, Sort::Date.label());
+                    ui.selectable_value(&mut sort, Sort::Size, Sort::Size.label());
+                    ui.selectable_value(&mut sort, Sort::Msgs, Sort::Msgs.label());
                 });
             if sort != self.sort {
                 self.sort = sort;
@@ -1301,9 +1282,7 @@ impl App {
     }
 
     fn confirm_modal(&mut self, ctx: &egui::Context, plans: Vec<DeletePlan>) {
-        let bytes: u64 = plans.iter().map(|p| p.bytes).sum();
-        let files: usize = plans.iter().map(|p| p.paths.len()).sum();
-        let live = plans.iter().filter(|p| p.recent).count();
+        let PlanSummary { bytes, files, live } = del::summarize(&plans);
         let mut decision: Option<bool> = None;
 
         // Dim everything behind the dialog *and* swallow input aimed at it.

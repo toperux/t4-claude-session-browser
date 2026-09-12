@@ -10,7 +10,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::HashSet;
 
-use crate::del::{self, human_bytes};
+use crate::del::{self, human_bytes, PlanSummary};
 use crate::index::{truncate, Index, Project, SessionMeta, Sort};
 use crate::paths::ClaudeDir;
 use crate::transcript::{self, Entry, Event, LoadOpts};
@@ -20,22 +20,6 @@ enum Pane {
     Projects,
     Sessions,
     Preview,
-}
-
-fn next_sort(sort: Sort) -> Sort {
-    match sort {
-        Sort::Date => Sort::Size,
-        Sort::Size => Sort::Msgs,
-        Sort::Msgs => Sort::Date,
-    }
-}
-
-fn sort_label(sort: Sort) -> &'static str {
-    match sort {
-        Sort::Date => "date",
-        Sort::Size => "size",
-        Sort::Msgs => "msgs",
-    }
 }
 
 enum Mode {
@@ -257,22 +241,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::Confirm(plans) => {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let mut ok = 0;
-                    let mut err = None;
-                    for p in &plans {
-                        match del::execute(&app.dir, p) {
-                            Ok(()) => ok += 1,
-                            Err(e) => {
-                                err = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
+                    let outcome = del::execute_all(&app.dir, &plans);
                     app.marked.clear();
-                    app.status = match err {
-                        Some(e) => format!("deleted {ok}, then failed: {e}"),
-                        None => format!("deleted {ok} session(s) to the recycle bin"),
-                    };
+                    app.status = outcome.summary(del::summarize(&plans).bytes);
                     if let Err(e) = app.reload_index() {
                         app.status = format!("reindex failed: {e}");
                     }
@@ -307,7 +278,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.focus = Pane::Sessions;
         }
         KeyCode::Char('s') => {
-            app.sort = next_sort(app.sort);
+            app.sort = app.sort.next();
             app.refilter();
         }
         KeyCode::Char('r') => {
@@ -506,7 +477,7 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(
         "Sessions ({}) · sort:{}{}",
         app.visible.len(),
-        sort_label(app.sort),
+        app.sort.label(),
         if app.filter.is_empty() {
             String::new()
         } else {
@@ -639,9 +610,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_confirm(f: &mut Frame, plans: &[del::DeletePlan]) {
-    let bytes: u64 = plans.iter().map(|p| p.bytes).sum();
-    let files: usize = plans.iter().map(|p| p.paths.len()).sum();
-    let live = plans.iter().filter(|p| p.recent).count();
+    let PlanSummary { bytes, files, live } = del::summarize(plans);
 
     let mut lines = vec![
         Line::from(Span::styled(

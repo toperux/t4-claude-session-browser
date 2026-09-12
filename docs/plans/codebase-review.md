@@ -29,7 +29,7 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 | X2 | P3 | transcript | `transcript::load` fully deserializes every line incl. ~54% bookkeeping | high | fix: `memmem` pre-check for user/assistant before `from_slice`, sharing index.rs's byte-pattern constant so both scanners agree |
 | X3 | P3 | transcript | Multi-MB tool results copied in full before 300-char truncation | high | fix: truncate (via existing char-safe helper) then `replace`; cap `headline_for` fallback |
 | C2 | P3 | cli | Non-interactive stdin → `delete` prints `aborted`, exits 0 | high | fix: `bail!("aborted")`; on EOF say `no terminal; pass --yes` |
-| C3 | P3 | cli | Mid-loop delete failure aborts without saying what was already trashed | high | fix: stop at first failure, report `deleted N of M, then failed`; **folded into S1** |
+| C3 | P3 | cli | Mid-loop delete failure aborts without saying what was already trashed | high | ✅ fix: stop at first failure, report `deleted N of M, then failed`; **folded into S1** |
 | T4 | P3 | tui | 80-col terminal clips size, msg count and `ACTIVE?` from session rows | high | fix: `Constraint::Min` on sessions/preview; move `ACTIVE?` to the front of the metadata line; drop indent + short timestamp under ~40 cols |
 | T5 | P3 | tui | Marks are global across project/filter changes; `d` deletes off-screen sessions | medium | fix: keep global marks; confirm dialog shows "N of these are outside the current view" in **both** TUI and GUI |
 | K2 | P3 | packaging | install.sh routes openSUSE into an rpm whose requires cannot resolve | medium | fix: drop the zypper branch, fall through to the tarball hint |
@@ -39,7 +39,7 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 | K6 | P3 | packaging | `shasum --quiet` rejected by older macOS shasum | medium | fix: drop `--quiet` (note: `-s` is shasum-only, GNU has none) |
 | K7 | P3 | packaging | `$dir` interpolated into a sed replacement unescaped (`&`, `|`, `\`) | high | fix: `grep -v '^Exec='` + `printf` the Exec line |
 | K8 | P3 | packaging | No `StartupWMClass` / `app_id`, so the launcher icon never attaches to the window | medium | fix: `.with_app_id("csb")` on the eframe viewport |
-| S1 | P4 | simplify | Delete-execute loop, plan summary and Sort label duplicated GUI ↔ TUI, already drifted | high | fix: `del::execute_all`, `del::PlanSummary`, `Sort::next/label`; all three front ends call them; **land before C/D** |
+| S1 | P4 | simplify | Delete-execute loop, plan summary and Sort label duplicated GUI ↔ TUI, already drifted | high | ✅ fix: `del::execute_all`, `del::PlanSummary`, `Sort::next/label`; all three front ends call them; **land before C/D** |
 | S2 | P4 | simplify | `SessionMeta::first_ts` written and cached, never read | high | fix: delete field; schema bump shared with X1 |
 | S3 | P4 | perf | `Cache::get` allocates a String per lookup; `BufRead::split` allocates a Vec per line | high | fix: `.as_ref()`; `read_until` + reused buf, done with X2 |
 | S4 | P4 | perf | `Event::ToolUse.raw` unbounded and rendered whole in the GUI | medium | fix: cap at 20 000 like ToolResult, in the GUI preview worker (same place as G5), not in `blocks_of` |

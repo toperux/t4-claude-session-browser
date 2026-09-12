@@ -87,6 +87,23 @@ pub enum Sort {
 }
 
 impl Sort {
+    /// The next ordering in the UIs' cycle.
+    pub fn next(self) -> Sort {
+        match self {
+            Sort::Date => Sort::Size,
+            Sort::Size => Sort::Msgs,
+            Sort::Msgs => Sort::Date,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Date => "date",
+            Sort::Size => "size",
+            Sort::Msgs => "msgs",
+        }
+    }
+
     pub fn apply<S: Borrow<SessionMeta>>(self, list: &mut [S]) {
         match self {
             Sort::Date => list.sort_by_key(|s| Reverse(s.borrow().activity())),
@@ -698,6 +715,17 @@ mod tests {
     fn t(prompts: &[&str]) -> Option<String> {
         let owned: Vec<String> = prompts.iter().map(|s| s.to_string()).collect();
         derive_title(&None, &None, &owned)
+    }
+
+    #[test]
+    fn sort_cycles_through_every_ordering() {
+        let mut sort = Sort::Date;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(sort.label());
+            sort = sort.next();
+        }
+        assert_eq!(seen, ["date", "size", "msgs", "date"]);
     }
 
     #[test]

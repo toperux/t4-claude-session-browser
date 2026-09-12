@@ -233,11 +233,13 @@ pub fn delete(
         return Ok(());
     }
 
-    for p in &plans {
-        del::execute(dir, p).with_context(|| format!("deleting session {}", p.id))?;
+    let outcome = del::execute_all(dir, &plans);
+    println!("{}", outcome.summary(total));
+    match outcome.failed {
+        // Already reported above, but the exit status has to say so too.
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    println!("deleted {} session(s)", plans.len());
-    Ok(())
 }
 
 fn matches_project(s: &SessionMeta, project: Option<&str>) -> bool {
