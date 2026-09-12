@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
-use chrono::{Duration, Local, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use serde_json::json;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
 
 use crate::del::{self, human_bytes};
 use crate::index::{Index, SessionMeta, Sort};
@@ -9,7 +9,7 @@ use crate::paths::ClaudeDir;
 use crate::transcript::{self, Event, LoadOpts};
 
 // Table headers stay as args so they share the row format string's width specs.
-#[allow(clippy::print_literal)]
+#[allow(clippy::write_literal)]
 pub fn list(index: &Index, project: Option<&str>, sort: Sort, as_json: bool) -> Result<()> {
     let mut sessions: Vec<&SessionMeta> = index
         .sessions
@@ -17,6 +17,10 @@ pub fn list(index: &Index, project: Option<&str>, sort: Sort, as_json: bool) -> 
         .filter(|s| matches_project(s, project))
         .collect();
     sort.apply(&mut sessions);
+
+    // Every stdout write goes through `writeln!` so a closed pipe (`csb list |
+    // head`) is an io error main can turn into a clean exit, not a panic.
+    let mut out = BufWriter::new(std::io::stdout().lock());
 
     if as_json {
         let rows: Vec<_> = sessions
@@ -28,7 +32,9 @@ pub fn list(index: &Index, project: Option<&str>, sort: Sort, as_json: bool) -> 
                     "project": s.project_slug,
                     "cwd": s.cwd,
                     "gitBranch": s.git_branch,
-                    "path": s.path,
+                    // Lossy, not the `PathBuf`: `json!` unwraps a conversion
+                    // that fails on a non-UTF-8 path.
+                    "path": s.path.to_string_lossy(),
                     "sizeBytes": s.size_bytes,
                     "lastActivity": s.activity().to_rfc3339(),
                     "userMessages": s.user_msgs,
@@ -37,22 +43,26 @@ pub fn list(index: &Index, project: Option<&str>, sort: Sort, as_json: bool) -> 
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
+        out.flush()?;
         return Ok(());
     }
 
     if sessions.is_empty() {
-        println!("no sessions found");
+        writeln!(out, "no sessions found")?;
+        out.flush()?;
         return Ok(());
     }
 
     let total: u64 = sessions.iter().map(|s| s.size_bytes).sum();
-    println!(
+    writeln!(
+        out,
         "{:<8}  {:<16}  {:>6}  {:>9}  {}",
         "ID", "LAST ACTIVITY", "MSGS", "SIZE", "TITLE"
-    );
+    )?;
     for s in &sessions {
-        println!(
+        writeln!(
+            out,
             "{:<8}  {:<16}  {:>6}  {:>9}  {}",
             s.short_id(),
             s.activity()
@@ -62,33 +72,39 @@ pub fn list(index: &Index, project: Option<&str>, sort: Sort, as_json: bool) -> 
             s.user_msgs + s.assistant_msgs,
             human_bytes(s.size_bytes),
             crate::index::truncate(&s.title, 70),
-        );
+        )?;
     }
-    println!("\n{} sessions, {}", sessions.len(), human_bytes(total));
+    writeln!(out, "\n{} sessions, {}", sessions.len(), human_bytes(total))?;
+    out.flush()?;
     Ok(())
 }
 
 // Table headers stay as args so they share the row format string's width specs.
-#[allow(clippy::print_literal)]
+#[allow(clippy::write_literal)]
 pub fn projects(index: &Index) -> Result<()> {
     let projects = index.projects();
+    let mut out = BufWriter::new(std::io::stdout().lock());
     if projects.is_empty() {
-        println!("no projects found");
+        writeln!(out, "no projects found")?;
+        out.flush()?;
         return Ok(());
     }
-    println!(
+    writeln!(
+        out,
         "{:<6}  {:>9}  {:<40}  {}",
         "SESS", "SIZE", "SLUG", "LOCATION"
-    );
+    )?;
     for p in &projects {
-        println!(
+        writeln!(
+            out,
             "{:<6}  {:>9}  {:<40}  {}",
             p.count,
             human_bytes(p.bytes),
             crate::index::truncate(&p.slug, 40),
             p.label,
-        );
+        )?;
     }
+    out.flush()?;
     Ok(())
 }
 
@@ -102,33 +118,34 @@ pub fn show(index: &Index, needle: &str, raw: bool, sidechains: bool) -> Result<
         return Ok(());
     }
 
-    println!("# {}", meta.title);
-    println!("  id       {}", meta.id);
-    println!("  cwd      {}", meta.location());
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    writeln!(out, "# {}", meta.title)?;
+    writeln!(out, "  id       {}", meta.id)?;
+    writeln!(out, "  cwd      {}", meta.location())?;
     if let Some(b) = &meta.git_branch {
-        println!("  branch   {b}");
+        writeln!(out, "  branch   {b}")?;
     }
-    println!(
+    writeln!(
+        out,
         "  activity {}",
         meta.activity()
             .with_timezone(&Local)
             .format("%Y-%m-%d %H:%M")
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  volume   {} messages, {} tool calls, {}",
         meta.user_msgs + meta.assistant_msgs,
         meta.tool_calls,
         human_bytes(meta.size_bytes)
-    );
-    println!();
+    )?;
+    writeln!(out)?;
 
     let opts = LoadOpts {
         max_entries: usize::MAX,
         include_sidechains: sidechains,
     };
     let t = transcript::load(&meta.path, &opts)?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
     for entry in &t.entries {
         let marker = if entry.sidechain { "|" } else { " " };
         match &entry.event {
@@ -152,7 +169,43 @@ pub fn show(index: &Index, needle: &str, raw: bool, sidechains: bool) -> Result<
             }
         }
     }
+    out.flush()?;
     Ok(())
+}
+
+/// The sessions `delete` would act on: every explicit id or prefix, plus
+/// everything idle since `now - older_than`, each session only once.
+fn select<'a>(
+    index: &'a Index,
+    ids: &[String],
+    older_than: Option<&str>,
+    project: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Vec<&'a SessionMeta>> {
+    let mut targets: Vec<&SessionMeta> = Vec::new();
+
+    for needle in ids {
+        let meta = index.find(needle)?;
+        if !targets.iter().any(|t| t.id == meta.id) {
+            targets.push(meta);
+        }
+    }
+
+    if let Some(spec) = older_than {
+        let cutoff = now - parse_duration(spec)?;
+        for s in &index.sessions {
+            if s.activity() < cutoff
+                && matches_project(s, project)
+                && !targets.iter().any(|t| t.id == s.id)
+            {
+                targets.push(s);
+            }
+        }
+    } else if ids.is_empty() {
+        bail!("give session ids, or --older-than to select by age");
+    }
+
+    Ok(targets)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -166,31 +219,12 @@ pub fn delete(
     yes: bool,
     force: bool,
 ) -> Result<()> {
-    let mut targets: Vec<&SessionMeta> = Vec::new();
-
-    for needle in ids {
-        let meta = index.find(needle)?;
-        if !targets.iter().any(|t| t.id == meta.id) {
-            targets.push(meta);
-        }
-    }
-
-    if let Some(spec) = older_than {
-        let cutoff = Utc::now() - parse_duration(spec)?;
-        for s in &index.sessions {
-            if s.activity() < cutoff
-                && matches_project(s, project)
-                && !targets.iter().any(|t| t.id == s.id)
-            {
-                targets.push(s);
-            }
-        }
-    } else if ids.is_empty() {
-        bail!("give session ids, or --older-than to select by age");
-    }
+    let targets = select(index, ids, older_than, project, Utc::now())?;
+    let mut out = BufWriter::new(std::io::stdout().lock());
 
     if targets.is_empty() {
-        println!("nothing matched");
+        writeln!(out, "nothing matched")?;
+        out.flush()?;
         return Ok(());
     }
 
@@ -199,19 +233,24 @@ pub fn delete(
 
     for p in &plans {
         let flag = if p.recent { "  [ACTIVE?]" } else { "" };
-        println!("{} {}{flag}", p.short_id(), p.title);
+        writeln!(out, "{} {}{flag}", p.short_id(), p.title)?;
         for path in &p.paths {
-            println!("    {}", path.display());
+            writeln!(out, "    {}", path.display())?;
         }
     }
-    println!(
+    writeln!(
+        out,
         "\n{} session(s), {} to the recycle bin",
         plans.len(),
         human_bytes(total)
-    );
+    )?;
+    // The plan has to be on screen before `confirm` asks about it, and before
+    // any of the refusals below reach stderr.
+    out.flush()?;
 
     if dry_run {
-        println!("(dry run - nothing deleted)");
+        writeln!(out, "(dry run - nothing deleted)")?;
+        out.flush()?;
         return Ok(());
     }
 
@@ -228,13 +267,15 @@ pub fn delete(
         );
     }
 
+    // Non-zero exit: a script that asked for a delete and got none did not
+    // succeed.
     if !yes && !confirm("delete these sessions?")? {
-        println!("aborted");
-        return Ok(());
+        bail!("aborted");
     }
 
     let outcome = del::execute_all(dir, &plans);
-    println!("{}", outcome.summary(total));
+    writeln!(out, "{}", outcome.summary(total))?;
+    out.flush()?;
     match outcome.failed {
         // Already reported above, but the exit status has to say so too.
         Some(e) => Err(e),
@@ -260,7 +301,11 @@ fn confirm(prompt: &str) -> Result<bool> {
     print!("{prompt} [y/N] ");
     std::io::stdout().flush()?;
     let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
+    // EOF, not a "no": a cron job with stdin closed must fail loudly rather
+    // than report a clean run in which nothing was deleted.
+    if std::io::stdin().lock().read_line(&mut answer)? == 0 {
+        bail!("no terminal to confirm on; pass --yes");
+    }
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
@@ -349,6 +394,106 @@ pub fn update(check_only: bool, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// A fixed "now", so `--older-than` cutoffs are not wall-clock dependent.
+    fn now() -> DateTime<Utc> {
+        DateTime::UNIX_EPOCH + Duration::days(20_000)
+    }
+
+    fn meta(id: &str, slug: &str, idle: Duration) -> SessionMeta {
+        SessionMeta {
+            id: id.into(),
+            path: PathBuf::new(),
+            project_slug: slug.into(),
+            size_bytes: 0,
+            modified_ms: 0,
+            first_ts: None,
+            last_ts: Some(now() - idle),
+            title: String::new(),
+            cwd: None,
+            git_branch: None,
+            user_msgs: 0,
+            assistant_msgs: 0,
+            tool_calls: 0,
+        }
+    }
+
+    fn index(sessions: Vec<SessionMeta>) -> Index {
+        Index {
+            sessions,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn ids_of(targets: &[&SessionMeta]) -> Vec<String> {
+        targets.iter().map(|s| s.id.clone()).collect()
+    }
+
+    #[test]
+    fn explicit_ids_resolve_and_dedupe() {
+        let ix = index(vec![
+            meta("aaaa1111", "p", Duration::days(1)),
+            meta("bbbb2222", "p", Duration::days(1)),
+        ]);
+        // Full id and a prefix of the same session count once.
+        let ids = ["aaaa1111".to_string(), "aaa".to_string()];
+        let got = select(&ix, &ids, None, None, now()).unwrap();
+        assert_eq!(ids_of(&got), ["aaaa1111"]);
+    }
+
+    #[test]
+    fn older_than_unions_with_explicit_ids() {
+        let ix = index(vec![
+            meta("old1", "p", Duration::days(40)),
+            meta("old2", "p", Duration::days(40)),
+            meta("new1", "p", Duration::hours(1)),
+        ]);
+        let ids = ["old1".to_string(), "new1".to_string()];
+        let got = select(&ix, &ids, Some("30d"), None, now()).unwrap();
+        // Explicit ids keep their order, the age sweep appends what is new.
+        assert_eq!(ids_of(&got), ["old1", "new1", "old2"]);
+    }
+
+    #[test]
+    fn older_than_respects_the_project() {
+        let ix = index(vec![
+            meta("a1", "-src-alpha", Duration::days(40)),
+            meta("b1", "-src-beta", Duration::days(40)),
+        ]);
+        let got = select(&ix, &[], Some("30d"), Some("alpha"), now()).unwrap();
+        assert_eq!(ids_of(&got), ["a1"]);
+        let all = select(&ix, &[], Some("30d"), Some("all"), now()).unwrap();
+        assert_eq!(ids_of(&all), ["a1", "b1"]);
+    }
+
+    #[test]
+    fn neither_ids_nor_older_than_is_an_error() {
+        let ix = index(vec![meta("a1", "p", Duration::days(1))]);
+        let e = select(&ix, &[], None, None, now()).unwrap_err().to_string();
+        assert!(e.contains("give session ids"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_id_is_refused() {
+        let ix = index(vec![meta("a1", "p", Duration::days(1))]);
+        let e = select(&ix, &[String::new()], None, None, now())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("empty session id"), "{e}");
+    }
+
+    #[test]
+    fn an_ambiguous_prefix_is_refused() {
+        let ix = index(vec![
+            meta("aaa1", "p", Duration::days(1)),
+            meta("aaa2", "p", Duration::days(1)),
+        ]);
+        let e = select(&ix, &["aaa".to_string()], None, None, now())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("matches"), "{e}");
+    }
 
     #[test]
     fn durations() {

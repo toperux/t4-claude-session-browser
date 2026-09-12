@@ -89,7 +89,25 @@ fn index_for_cli(dir: &ClaudeDir) -> Result<Index> {
     Ok(index)
 }
 
+/// A reader that went away (`csb list | head`) is not a failure to report: the
+/// pipe closing is what `head` does. The io error arrives wrapped in anyhow
+/// context from `writeln!`, so the whole chain has to be checked.
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
 fn main() -> Result<()> {
+    match run() {
+        Err(e) if is_broken_pipe(&e) => Ok(()),
+        other => other,
+    }
+}
+
+fn run() -> Result<()> {
     let args = Args::parse();
 
     // `update` must work on a machine with no ~/.claude at all, so the directory

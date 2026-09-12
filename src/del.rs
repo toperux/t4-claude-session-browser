@@ -160,6 +160,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_covers_the_transcript_and_every_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("claude");
+        let id = "0241ed3f-1b2c-4d5e-8f9a-0b1c2d3e4f5a";
+        let project = root.join("projects").join("-src-proj");
+        std::fs::create_dir_all(project.join(id)).unwrap();
+        std::fs::write(project.join(format!("{id}.jsonl")), b"12345").unwrap();
+        std::fs::write(project.join(id).join("state.json"), b"12").unwrap();
+        std::fs::create_dir_all(root.join("session-env").join(id)).unwrap();
+        std::fs::write(root.join("session-env").join(id).join("env"), b"123").unwrap();
+        std::fs::create_dir_all(root.join("file-history").join(id)).unwrap();
+        std::fs::write(root.join("file-history").join(id).join("h.json"), b"1").unwrap();
+        let dir = ClaudeDir::resolve(Some(&root)).unwrap();
+
+        let meta = SessionMeta {
+            id: id.into(),
+            path: dir.projects().join("-src-proj").join(format!("{id}.jsonl")),
+            project_slug: "-src-proj".into(),
+            size_bytes: 5,
+            modified_ms: 0,
+            first_ts: None,
+            last_ts: None,
+            title: "t".into(),
+            cwd: None,
+            git_branch: None,
+            user_msgs: 0,
+            assistant_msgs: 0,
+            tool_calls: 0,
+        };
+
+        // Expected paths come off `dir`, which is canonicalized.
+        let in_project = dir.projects().join("-src-proj");
+        let plan = plan(&dir, &meta);
+        assert_eq!(
+            plan.paths,
+            vec![
+                in_project.join(format!("{id}.jsonl")),
+                in_project.join(id),
+                dir.root.join("session-env").join(id),
+                dir.root.join("file-history").join(id),
+            ]
+        );
+        assert_eq!(plan.bytes, 5 + 2 + 3 + 1);
+        assert!(!plan.recent, "an epoch timestamp is not a live session");
+    }
+
+    #[test]
     fn execute_rejects_paths_outside_the_claude_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("claude");

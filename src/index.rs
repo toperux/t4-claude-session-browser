@@ -165,7 +165,35 @@ impl Index {
             }
         }
 
-        sessions.sort_by_key(|s| Reverse(s.activity()));
+        // The path breaks activity ties so the order - and with it which
+        // duplicate id survives below - does not depend on readdir order.
+        sessions.sort_by(|a, b| {
+            b.activity()
+                .cmp(&a.activity())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        // Sessions are keyed by bare id everywhere downstream, so two project
+        // dirs holding the same stem (a stray `notes.jsonl` in each) would take
+        // both files down together on a delete. Keep the newest, which the sort
+        // above put first, and report the rest.
+        let mut kept: HashMap<String, PathBuf> = HashMap::new();
+        sessions.retain(|s| match kept.get(&s.id) {
+            Some(winner) => {
+                warnings.push(format!(
+                    "{}: duplicate session id {}, keeping the newer {}",
+                    s.path.display(),
+                    s.id,
+                    winner.display()
+                ));
+                false
+            }
+            None => {
+                kept.insert(s.id.clone(), s.path.clone());
+                true
+            }
+        });
+
         cache.store(&sessions, &dir.projects());
         Ok(Self { sessions, warnings })
     }
@@ -174,8 +202,8 @@ impl Index {
     pub fn warning_summary(&self) -> Option<String> {
         let first = self.warnings.first()?;
         Some(match self.warnings.len() {
-            1 => format!("skipped 1 unreadable file ({first})"),
-            n => format!("skipped {n} unreadable files (first: {first})"),
+            1 => format!("skipped 1 file ({first})"),
+            n => format!("skipped {n} files (first: {first})"),
         })
     }
 
@@ -247,6 +275,11 @@ impl Index {
 
     /// Resolve a full id or unique id prefix.
     pub fn find(&self, needle: &str) -> Result<&SessionMeta> {
+        // Every id starts with "", so an unset shell variable would otherwise
+        // resolve to the whole index (or to its only session).
+        if needle.is_empty() {
+            anyhow::bail!("empty session id");
+        }
         let hits: Vec<&SessionMeta> = self
             .sessions
             .iter()
@@ -285,7 +318,13 @@ fn discover(dir: &ClaudeDir) -> Result<Discovered> {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let slug = entry.file_name().to_string_lossy().into_owned();
+        // A lossy slug does not name the directory it came from, so every path
+        // rebuilt from it (deletion, the cache key) would point somewhere else.
+        // Such a project is skipped outright rather than half-handled.
+        let Some(slug) = entry.file_name().to_str().map(str::to_owned) else {
+            warnings.push(format!("{}: not UTF-8, skipped", entry.path().display()));
+            continue;
+        };
         let files = match std::fs::read_dir(entry.path()) {
             Ok(files) => files,
             Err(e) => {
