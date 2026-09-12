@@ -396,7 +396,7 @@ impl App {
             return;
         }
         self.focused = Some(id.to_string());
-        self.preview = None;
+        self.clear_preview();
         self.preview_error = None;
         self.preview_shown = PAGE;
 
@@ -416,7 +416,7 @@ impl App {
                     // frame in the draw code. `transcript::load` itself stays
                     // untouched: `csb show` prints the whole text.
                     for entry in &mut t.entries {
-                        cap_for_preview(&mut entry.event);
+                        t.truncated |= cap_for_preview(&mut entry.event);
                     }
                     t
                 })
@@ -428,6 +428,17 @@ impl App {
             id: id.to_string(),
             rx,
         });
+    }
+
+    /// Drop the loaded transcript and everything derived from it: the
+    /// lower-cased search text and the match list describe that transcript
+    /// only, and kept around they would answer the find box for a session that
+    /// is no longer shown.
+    fn clear_preview(&mut self) {
+        self.preview = None;
+        self.preview_lower.clear();
+        self.preview_matches.clear();
+        self.preview_matches_for = (String::new(), String::new());
     }
 
     fn poll_preview(&mut self) {
@@ -631,7 +642,7 @@ impl App {
             // A preview still parsing for the session just deleted would
             // otherwise land and replace the delete status with its own error.
             self.pending = None;
-            self.preview = None;
+            self.clear_preview();
             self.preview_error = None;
         }
         self.rebuild_projects();
@@ -652,11 +663,14 @@ impl App {
             ),
         };
         self.delete_rx = None;
-        self.status = summary;
-        self.marked.clear();
+        // Status after `apply_index`, not before: its warning summary would
+        // otherwise hide what the delete actually did.
         match index {
-            Ok(index) => self.apply_index(index),
-            Err(e) => self.status = format!("{}; reindex failed: {e}", self.status),
+            Ok(index) => {
+                self.apply_index(index);
+                self.status = summary;
+            }
+            Err(e) => self.status = format!("{summary}; reindex failed: {e}"),
         }
     }
 }
@@ -968,7 +982,10 @@ impl App {
                 if ui.button("⚙").on_hover_text("Settings").clicked() {
                     self.settings_open = !self.settings_open;
                 }
-                ui.label(RichText::new(&self.status).color(ROLE_USER));
+                // A warning can carry two full paths; clipped here, whole on hover,
+                // so it cannot run left over the toolbar.
+                ui.add(egui::Label::new(RichText::new(&self.status).color(ROLE_USER)).truncate())
+                    .on_hover_text(&self.status);
             });
         });
         ui.add_space(4.0);
@@ -1601,13 +1618,19 @@ fn project_row(
 /// Cap what the preview pane will lay out. Done once per load on the worker
 /// thread: `transcript::load` and `blocks_of` stay untouched, because `csb show`
 /// prints the whole text through them.
-fn cap_for_preview(event: &mut Event) {
-    match event {
-        Event::User(text) | Event::Assistant(text) | Event::Thinking(text) => {
-            *text = truncate(text, 12_000)
-        }
-        Event::ToolUse { raw, .. } | Event::ToolResult { raw, .. } => *raw = truncate(raw, 20_000),
-    }
+///
+/// Returns true when it cut something, which is what marks the transcript as
+/// truncated for the pane's note. The find box is built from the capped text,
+/// so text past the cap is not searchable in the GUI; `csb show` has all of it.
+fn cap_for_preview(event: &mut Event) -> bool {
+    let (text, max) = match event {
+        Event::User(text) | Event::Assistant(text) | Event::Thinking(text) => (text, 12_000),
+        Event::ToolUse { raw, .. } | Event::ToolResult { raw, .. } => (raw, 20_000),
+    };
+    let capped = truncate(text, max);
+    let cut = capped != *text;
+    *text = capped;
+    cut
 }
 
 /// `session_id` and `index` salt the collapsing headers: egui persists their
