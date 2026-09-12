@@ -8,3 +8,21 @@ updates:
     commit-message:
       prefix: ci
       include: scope
+
+  # The Rust tree is the whole app; without this it never gets bumped and a
+  # security advisory against a transitive crate goes unnoticed. These bumps
+  # are not CI changes, so `build` is their type. The `dependencies` label
+  # keeps them off the release page (see .github/release.yml), whatever the
+  # prefix. One PR for the lot: the bumps share a Cargo.lock, so separate PRs
+  # would conflict with each other and each need a rebase to go green.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      cargo:
+        patterns:
+          - "*"
