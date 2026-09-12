@@ -87,6 +87,9 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
             .with_inner_size([1400.0, 880.0])
             .with_min_inner_size(MIN_WINDOW)
             .with_decorations(!own_frame)
+            // Matches installer/csb.desktop's basename, so the Wayland app_id
+            // (X11 WM_CLASS) ties the window to the launcher entry and its icon.
+            .with_app_id("csb")
             .with_title("Claude Session Browser"),
         ..Default::default()
     };
@@ -171,8 +174,13 @@ fn wsl_host_zoom() -> Option<f32> {
         .recv_timeout(std::time::Duration::from_secs(3))
         .ok()?
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let hex = text
+    parse_applied_dpi(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The zoom factor `reg query`'s output implies, or `None` when the value is
+/// absent, unparseable, or the 96 DPI default (which asks for no zoom at all).
+fn parse_applied_dpi(reg_output: &str) -> Option<f32> {
+    let hex = reg_output
         .lines()
         .find(|l| l.contains("AppliedDPI"))?
         .split_whitespace()
@@ -226,6 +234,43 @@ struct PendingPreview {
     rx: Receiver<Result<Transcript, String>>,
 }
 
+/// The confirm dialog's two states: the plans are still being worked out, or
+/// they are on screen waiting for the user.
+enum Confirm {
+    Planning { rx: Receiver<Vec<DeletePlan>> },
+    Ready(Vec<DeletePlan>),
+}
+
+/// Work out what each target would take with it, off the UI thread: `del::plan`
+/// walks every sidecar directory for its size.
+fn spawn_plan(ctx: egui::Context, dir: ClaudeDir, targets: Vec<SessionMeta>) -> Confirm {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let plans: Vec<DeletePlan> = targets.iter().map(|m| del::plan(&dir, m)).collect();
+        let _ = tx.send(plans);
+        ctx.request_repaint();
+    });
+    Confirm::Planning { rx }
+}
+
+/// Trash the plans and rebuild the index off the UI thread. Sends the status
+/// line (the summary is computed here, where the outcome lives) and the index.
+fn spawn_delete(
+    ctx: egui::Context,
+    dir: ClaudeDir,
+    plans: Vec<DeletePlan>,
+) -> Receiver<(String, Result<Index, String>)> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let outcome = del::execute_all(&dir, &plans);
+        let summary = outcome.summary(del::summarize(&plans).bytes);
+        let index = Index::build(&dir).map_err(|e| e.to_string());
+        let _ = tx.send((summary, index));
+        ctx.request_repaint();
+    });
+    rx
+}
+
 struct App {
     dir: ClaudeDir,
     index: Index,
@@ -255,8 +300,15 @@ struct App {
     preview_error: Option<String>,
     preview_search: String,
     preview_shown: usize,
+    /// Indices into the loaded transcript's entries that the find box keeps,
+    /// and the `(session id, needle)` they were computed for. Filtering every
+    /// frame is what this avoids.
+    preview_matches: Vec<usize>,
+    preview_matches_for: (String, String),
 
-    confirm: Option<Vec<DeletePlan>>,
+    confirm: Option<Confirm>,
+    /// A delete plus reindex in flight on a worker thread.
+    delete_rx: Option<Receiver<(String, Result<Index, String>)>>,
     status: String,
     settings_open: bool,
     /// Outcome of the last manual update check, shown in the settings window.
@@ -300,7 +352,10 @@ impl App {
             preview_error: None,
             preview_search: String::new(),
             preview_shown: PAGE,
+            preview_matches: Vec::new(),
+            preview_matches_for: (String::new(), String::new()),
             confirm: None,
+            delete_rx: None,
             status: String::new(),
             settings_open: false,
             update_note: String::new(),
@@ -355,7 +410,17 @@ impl App {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = transcript::load(&path, &LoadOpts::default()).map_err(|e| e.to_string());
+            let result = transcript::load(&path, &LoadOpts::default())
+                .map(|mut t| {
+                    // Capped here, once per load, rather than per entry per
+                    // frame in the draw code. `transcript::load` itself stays
+                    // untouched: `csb show` prints the whole text.
+                    for entry in &mut t.entries {
+                        cap_for_preview(&mut entry.event);
+                    }
+                    t
+                })
+                .map_err(|e| e.to_string());
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -378,6 +443,11 @@ impl App {
         };
         let id = pending.id.clone();
         self.pending = None;
+        // The selection moved on - or the session was deleted - while this was
+        // parsing. Its failure is not news, and its transcript is not wanted.
+        if self.focused.as_deref() != Some(id.as_str()) {
+            return;
+        }
         match received {
             Ok(t) => {
                 self.preview_lower = t
@@ -386,6 +456,8 @@ impl App {
                     .map(|e| e.event.searchable().to_lowercase())
                     .collect();
                 self.preview = Some((id, t));
+                // Indices from the previous transcript do not describe this one.
+                self.preview_matches_for = (String::new(), String::new());
             }
             Err(e) => {
                 self.status = format!("preview failed: {e}");
@@ -533,53 +605,83 @@ impl App {
         self.index.sessions.iter().find(|s| &s.id == id)
     }
 
-    /// Count and size of what `Index::marked_or` would return, without
-    /// cloning. Must mirror its selection rule exactly, or the button and the
-    /// action would disagree.
     fn selection_summary(&self) -> (usize, u64) {
-        if self.marked.is_empty() {
-            return match self.focused_meta() {
-                Some(s) => (1, s.size_bytes),
-                None => (0, 0),
-            };
-        }
-        let bytes = self
-            .index
-            .sessions
-            .iter()
-            .filter(|s| self.marked.contains(&s.id))
-            .map(|s| s.size_bytes)
-            .sum();
-        (self.marked.len(), bytes)
+        selection_summary(&self.index, &self.marked, self.focused_meta())
     }
 
     fn reindex(&mut self) {
         match Index::build(&self.dir) {
-            Ok(index) => {
-                self.index = index;
-                if let Some(summary) = self.index.warning_summary() {
-                    self.status = summary;
-                }
-                let alive: HashSet<&String> = self.index.sessions.iter().map(|s| &s.id).collect();
-                self.marked.retain(|id| alive.contains(id));
-                if self.focused.as_ref().is_some_and(|f| !alive.contains(f)) {
-                    self.focused = None;
-                    self.preview = None;
-                    self.preview_error = None;
-                }
-                self.rebuild_projects();
-                self.refilter();
-            }
+            Ok(index) => self.apply_index(index),
             Err(e) => self.status = format!("reindex failed: {e}"),
         }
     }
 
-    fn run_delete(&mut self, plans: &[DeletePlan]) {
-        let outcome = del::execute_all(&self.dir, plans);
-        self.status = outcome.summary(del::summarize(plans).bytes);
-        self.marked.clear();
-        self.reindex();
+    /// Adopt a freshly built index, from the Reload button or a delete worker:
+    /// report unreadable files, forget marks and a focus whose session is gone,
+    /// then rebuild everything derived from it.
+    fn apply_index(&mut self, index: Index) {
+        self.index = index;
+        if let Some(summary) = self.index.warning_summary() {
+            self.status = summary;
+        }
+        let alive: HashSet<&String> = self.index.sessions.iter().map(|s| &s.id).collect();
+        self.marked.retain(|id| alive.contains(id));
+        if self.focused.as_ref().is_some_and(|f| !alive.contains(f)) {
+            self.focused = None;
+            // A preview still parsing for the session just deleted would
+            // otherwise land and replace the delete status with its own error.
+            self.pending = None;
+            self.preview = None;
+            self.preview_error = None;
+        }
+        self.rebuild_projects();
+        self.refilter();
     }
+
+    /// Take the delete worker's result: its status line, then its index.
+    fn poll_delete(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+
+        let Some(rx) = &self.delete_rx else { return };
+        let (summary, index) = match rx.try_recv() {
+            Ok(landed) => landed,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => (
+                "delete failed: worker stopped".to_string(),
+                Err("worker stopped".to_string()),
+            ),
+        };
+        self.delete_rx = None;
+        self.status = summary;
+        self.marked.clear();
+        match index {
+            Ok(index) => self.apply_index(index),
+            Err(e) => self.status = format!("{}; reindex failed: {e}", self.status),
+        }
+    }
+}
+
+/// Count and size of what `Index::marked_or` would return, without cloning.
+/// Must mirror its selection rule exactly, or the button and the action would
+/// disagree.
+fn selection_summary(
+    index: &Index,
+    marked: &HashSet<String>,
+    focused: Option<&SessionMeta>,
+) -> (usize, u64) {
+    if marked.is_empty() {
+        return match focused {
+            Some(s) => (1, s.size_bytes),
+            None => (0, 0),
+        };
+    }
+    let bytes = index
+        .sessions
+        .iter()
+        .filter(|s| marked.contains(&s.id))
+        .map(|s| s.size_bytes)
+        .sum();
+    (marked.len(), bytes)
 }
 
 impl eframe::App for App {
@@ -597,6 +699,7 @@ impl eframe::App for App {
             }
         }
         self.poll_preview();
+        self.poll_delete();
         self.poll_update(ctx);
 
         if self.own_frame {
@@ -618,8 +721,8 @@ impl eframe::App for App {
         if self.settings_open {
             self.settings_window(ctx);
         }
-        if let Some(plans) = self.confirm.take() {
-            self.confirm_modal(ctx, plans);
+        if let Some(confirm) = self.confirm.take() {
+            self.confirm_modal(ctx, confirm);
         }
 
         // XWayland under WSLg sometimes delivers a resize with no event eframe
@@ -848,7 +951,12 @@ impl App {
             }
 
             ui.separator();
-            if ui.button("⟲ Reload").clicked() {
+            // A delete worker is already rebuilding the index; a second build
+            // over the same tree would only race it.
+            if ui
+                .add_enabled(self.delete_rx.is_none(), egui::Button::new("⟲ Reload"))
+                .clicked()
+            {
                 self.reindex();
                 // reindex reports unreadable files; don't overwrite that.
                 if self.index.warnings.is_empty() {
@@ -1009,91 +1117,96 @@ impl App {
             + ui.text_style_height(&egui::TextStyle::Small)
             + 2.0 * ROW_MARGIN_Y;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, self.visible.len(), |ui, range| {
-                for i in range {
-                    let s = &self.visible[i];
-                    let focused = self.focused.as_deref() == Some(s.id.as_str());
-                    let mut mark = self.marked.contains(&s.id);
-
-                    let fill = if focused {
-                        ui.visuals().selection.bg_fill.gamma_multiply(0.55)
-                    } else if self.hovered.as_deref() == Some(s.id.as_str()) {
-                        ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.35)
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-
-                    // Track where the checkbox ends: the row's click target has
-                    // to start after it, or it would swallow every tick.
-                    let mut checkbox_right = 0.0_f32;
-                    let frame = egui::Frame::none()
-                        .fill(fill)
-                        .inner_margin(egui::Margin::symmetric(6.0, ROW_MARGIN_Y))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal_top(|ui| {
-                                let cb = ui.checkbox(&mut mark, "");
-                                if cb.changed() {
-                                    toggled = Some(s.id.clone());
-                                }
-                                checkbox_right = cb.rect.right();
-                                ui.vertical(|ui| {
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&s.title).strong())
-                                            .truncate(),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{}  ·  {} msgs  ·  {}",
-                                                s.activity()
-                                                    .with_timezone(&Local)
-                                                    .format("%Y-%m-%d %H:%M"),
-                                                s.user_msgs + s.assistant_msgs,
-                                                human_bytes(s.size_bytes),
-                                            ))
-                                            .small()
-                                            .weak(),
-                                        );
-                                        if s.is_recent() {
-                                            ui.label(
-                                                RichText::new("ACTIVE?").small().color(ROLE_ERROR),
-                                            );
-                                        }
-                                    });
-                                });
-                            });
-                        });
-
-                    // An explicit rect and a stable id, rather than interacting
-                    // with a layout response whose auto-id can shift per frame.
-                    let outer = frame.response.rect;
-                    let body_rect = egui::Rect::from_min_max(
-                        egui::pos2(checkbox_right + 4.0, outer.min.y),
-                        outer.max,
-                    );
-                    let resp = ui
-                        .interact(
-                            body_rect,
-                            egui::Id::new(("session-row", s.id.as_str())),
-                            Sense::click(),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if resp.hovered() {
-                        next_hovered = Some(s.id.clone());
-                    }
-
-                    if resp.clicked() {
-                        let mods = ui.input(|i| i.modifiers);
-                        clicked = Some((i, mods.ctrl || mods.command, mods.shift));
-                    }
-                }
-            });
+        // Not below the scroll area: `auto_shrink([false, false])` claims all
+        // the height there is, so anything after it is clipped away.
         if self.visible.is_empty() {
             ui.add_space(20.0);
             ui.label(RichText::new("no sessions match").weak());
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, self.visible.len(), |ui, range| {
+                    for i in range {
+                        let s = &self.visible[i];
+                        let focused = self.focused.as_deref() == Some(s.id.as_str());
+                        let mut mark = self.marked.contains(&s.id);
+
+                        let fill = if focused {
+                            ui.visuals().selection.bg_fill.gamma_multiply(0.55)
+                        } else if self.hovered.as_deref() == Some(s.id.as_str()) {
+                            ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.35)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+
+                        // Track where the checkbox ends: the row's click target has
+                        // to start after it, or it would swallow every tick.
+                        let mut checkbox_right = 0.0_f32;
+                        let frame = egui::Frame::none()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(6.0, ROW_MARGIN_Y))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal_top(|ui| {
+                                    let cb = ui.checkbox(&mut mark, "");
+                                    if cb.changed() {
+                                        toggled = Some(s.id.clone());
+                                    }
+                                    checkbox_right = cb.rect.right();
+                                    ui.vertical(|ui| {
+                                        ui.add(
+                                            egui::Label::new(RichText::new(&s.title).strong())
+                                                .truncate(),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{}  ·  {} msgs  ·  {}",
+                                                    s.activity()
+                                                        .with_timezone(&Local)
+                                                        .format("%Y-%m-%d %H:%M"),
+                                                    s.user_msgs + s.assistant_msgs,
+                                                    human_bytes(s.size_bytes),
+                                                ))
+                                                .small()
+                                                .weak(),
+                                            );
+                                            if s.is_recent() {
+                                                ui.label(
+                                                    RichText::new("ACTIVE?")
+                                                        .small()
+                                                        .color(ROLE_ERROR),
+                                                );
+                                            }
+                                        });
+                                    });
+                                });
+                            });
+
+                        // An explicit rect and a stable id, rather than interacting
+                        // with a layout response whose auto-id can shift per frame.
+                        let outer = frame.response.rect;
+                        let body_rect = egui::Rect::from_min_max(
+                            egui::pos2(checkbox_right + 4.0, outer.min.y),
+                            outer.max,
+                        );
+                        let resp = ui
+                            .interact(
+                                body_rect,
+                                egui::Id::new(("session-row", s.id.as_str())),
+                                Sense::click(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.hovered() {
+                            next_hovered = Some(s.id.clone());
+                        }
+
+                        if resp.clicked() {
+                            let mods = ui.input(|i| i.modifiers);
+                            clicked = Some((i, mods.ctrl || mods.command, mods.shift));
+                        }
+                    }
+                });
         }
 
         self.hovered = next_hovered;
@@ -1198,13 +1311,20 @@ impl App {
         }
 
         let needle = self.preview_search.to_lowercase();
-        let matches: Vec<&Entry> = transcript
-            .entries
-            .iter()
-            .zip(&self.preview_lower)
-            .filter(|(_, lower)| needle.is_empty() || lower.contains(&needle))
-            .map(|(e, _)| e)
-            .collect();
+        // Filtering 2000 entries on every frame of the WSLg repaint heartbeat
+        // is what the cache is for; the needle and the session rarely change.
+        if self.preview_matches_for.0 != meta.id || self.preview_matches_for.1 != needle {
+            self.preview_matches = transcript
+                .entries
+                .iter()
+                .enumerate()
+                .zip(&self.preview_lower)
+                .filter(|(_, lower)| needle.is_empty() || lower.contains(&needle))
+                .map(|((i, _), _)| i)
+                .collect();
+            self.preview_matches_for = (meta.id.clone(), needle.clone());
+        }
+        let matches = &self.preview_matches;
 
         if !needle.is_empty() {
             ui.label(
@@ -1220,8 +1340,10 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for entry in &matches[..shown] {
-                    draw_entry(ui, entry);
+                for &i in &matches[..shown] {
+                    // Collapse state is keyed by the entry's place in the
+                    // transcript, not by its slot in this filtered list.
+                    draw_entry(ui, &meta.id, i, &transcript.entries[i]);
                 }
                 ui.add_space(8.0);
                 if shown < matches.len() {
@@ -1268,22 +1390,52 @@ impl App {
                 } else {
                     format!("🗑 Delete {} session(s)", self.marked.len())
                 };
+                let deleting = self.delete_rx.is_some();
                 if ui
-                    .add_enabled(count > 0, egui::Button::new(RichText::new(text).strong()))
+                    .add_enabled(
+                        count > 0 && !deleting,
+                        egui::Button::new(RichText::new(text).strong()),
+                    )
                     .clicked()
                 {
                     let targets = self.index.marked_or(&self.marked, self.focused_meta());
-                    self.confirm = Some(targets.iter().map(|m| del::plan(&self.dir, m)).collect());
+                    self.confirm = Some(spawn_plan(ui.ctx().clone(), self.dir.clone(), targets));
                 }
                 ui.label(RichText::new("goes to the recycle bin").small().weak());
+                if deleting {
+                    ui.add(egui::Spinner::new());
+                    ui.label("deleting…");
+                }
             });
         });
         ui.add_space(6.0);
     }
 
-    fn confirm_modal(&mut self, ctx: &egui::Context, plans: Vec<DeletePlan>) {
-        let PlanSummary { bytes, files, live } = del::summarize(&plans);
-        let mut decision: Option<bool> = None;
+    fn confirm_modal(&mut self, ctx: &egui::Context, mut confirm: Confirm) {
+        use std::sync::mpsc::TryRecvError;
+
+        // The dialog is on screen from the click; the plans arrive into it.
+        if let Confirm::Planning { rx } = &confirm {
+            match rx.try_recv() {
+                Ok(plans) => confirm = Confirm::Ready(plans),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "delete cancelled: planner stopped".into();
+                    return;
+                }
+            }
+        }
+        // Marks are global, so a project or filter change leaves sessions
+        // marked that the list no longer shows. Say how many, as the TUI does.
+        let off_view = match &confirm {
+            Confirm::Ready(plans) => plans
+                .iter()
+                .filter(|p| !self.visible.iter().any(|s| s.id == p.id))
+                .count(),
+            Confirm::Planning { .. } => 0,
+        };
+        let mut cancelled = false;
+        let mut confirmed = false;
 
         // Dim everything behind the dialog *and* swallow input aimed at it.
         // Painting alone is not enough: the panels underneath stay live, so the
@@ -1314,66 +1466,98 @@ impl App {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .default_width(720.0)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "Move {} session(s) — {files} paths, {} — to the recycle bin?",
-                        plans.len(),
-                        human_bytes(bytes)
-                    ))
-                    .strong(),
-                );
-                if live > 0 {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "⚠ {live} of these were active in the last 5 minutes and may be open right now."
-                        ))
-                        .color(ROLE_ERROR)
-                        .strong(),
-                    );
-                }
-                ui.add_space(8.0);
-
-                // Bounded by the viewport, or a long list pushes the buttons
-                // off-screen with no way to dismiss the modal.
-                let list_height = (ctx.screen_rect().height() - 180.0).clamp(80.0, 320.0);
-                egui::ScrollArea::vertical()
-                    .max_height(list_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for p in &plans {
-                            ui.label(RichText::new(truncate(&p.title, 90)).strong());
-                            for path in &p.paths {
-                                ui.label(
-                                    RichText::new(format!("    {}", path.display()))
-                                        .small()
-                                        .weak()
-                                        .monospace(),
-                                );
-                            }
+                match &confirm {
+                    Confirm::Planning { .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("computing what will be removed…");
+                        });
+                    }
+                    Confirm::Ready(plans) => {
+                        let PlanSummary { bytes, files, live } = del::summarize(plans);
+                        ui.label(
+                            RichText::new(format!(
+                                "Move {} session(s) — {files} paths, {} — to the recycle bin?",
+                                plans.len(),
+                                human_bytes(bytes)
+                            ))
+                            .strong(),
+                        );
+                        if off_view > 0 {
                             ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "⚠ {off_view} of these are outside the current view"
+                                ))
+                                .color(ROLE_ERROR)
+                                .strong(),
+                            );
                         }
-                    });
+                        if live > 0 {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "⚠ {live} of these were active in the last 5 minutes and may be open right now."
+                                ))
+                                .color(ROLE_ERROR)
+                                .strong(),
+                            );
+                        }
+                        ui.add_space(8.0);
+
+                        // Bounded by the viewport, or a long list pushes the
+                        // buttons off-screen with no way to dismiss the modal.
+                        let list_height = (ctx.screen_rect().height() - 180.0).clamp(80.0, 320.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(list_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for p in plans {
+                                    ui.label(RichText::new(truncate(&p.title, 90)).strong());
+                                    for path in &p.paths {
+                                        ui.label(
+                                            RichText::new(format!("    {}", path.display()))
+                                                .small()
+                                                .weak()
+                                                .monospace(),
+                                        );
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                            });
+                    }
+                }
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
-                        decision = Some(false);
+                        cancelled = true;
                     }
+                    // Nothing to confirm until the plans are in: the dialog
+                    // would not yet be able to say what it is about to delete.
                     if ui
-                        .button(RichText::new("Delete").color(ROLE_ERROR).strong())
+                        .add_enabled(
+                            matches!(confirm, Confirm::Ready(_)),
+                            egui::Button::new(RichText::new("Delete").color(ROLE_ERROR).strong()),
+                        )
                         .clicked()
                     {
-                        decision = Some(true);
+                        confirmed = true;
                     }
                 });
             });
 
-        match decision {
-            Some(true) => self.run_delete(&plans),
-            Some(false) => self.status = "delete cancelled".into(),
+        if cancelled {
+            self.status = "delete cancelled".into();
+            return;
+        }
+        match confirm {
+            Confirm::Ready(plans) if confirmed => {
+                self.status = "deleting…".into();
+                self.delete_rx = Some(spawn_delete(ctx.clone(), self.dir.clone(), plans));
+            }
             // Still open: put it back for the next frame.
-            None => self.confirm = Some(plans),
+            still_open => self.confirm = Some(still_open),
         }
     }
 }
@@ -1414,7 +1598,22 @@ fn project_row(
     .clicked()
 }
 
-fn draw_entry(ui: &mut egui::Ui, entry: &Entry) {
+/// Cap what the preview pane will lay out. Done once per load on the worker
+/// thread: `transcript::load` and `blocks_of` stay untouched, because `csb show`
+/// prints the whole text through them.
+fn cap_for_preview(event: &mut Event) {
+    match event {
+        Event::User(text) | Event::Assistant(text) | Event::Thinking(text) => {
+            *text = truncate(text, 12_000)
+        }
+        Event::ToolUse { raw, .. } | Event::ToolResult { raw, .. } => *raw = truncate(raw, 20_000),
+    }
+}
+
+/// `session_id` and `index` salt the collapsing headers: egui persists their
+/// open/closed state by id, and a positional one would belong to the slot in
+/// the filtered list rather than to this entry.
+fn draw_entry(ui: &mut egui::Ui, session_id: &str, index: usize, entry: &Entry) {
     let stamp = entry
         .ts
         .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
@@ -1430,7 +1629,7 @@ fn draw_entry(ui: &mut egui::Ui, entry: &Entry) {
                     .small()
                     .color(ROLE_THINKING),
             )
-            .id_salt(ui.next_auto_id())
+            .id_salt((session_id, index))
             .show(ui, |ui| {
                 ui.label(RichText::new(text).weak());
             });
@@ -1444,7 +1643,7 @@ fn draw_entry(ui: &mut egui::Ui, entry: &Entry) {
             egui::CollapsingHeader::new(
                 RichText::new(truncate(&format!("▸ {name}: {headline}"), 110)).color(ROLE_TOOL),
             )
-            .id_salt(ui.next_auto_id())
+            .id_salt((session_id, index))
             .show(ui, |ui| {
                 ui.label(RichText::new(raw).monospace().small());
             });
@@ -1464,9 +1663,9 @@ fn draw_entry(ui: &mut egui::Ui, entry: &Entry) {
                     .small()
                     .color(color),
             )
-            .id_salt(ui.next_auto_id())
+            .id_salt((session_id, index))
             .show(ui, |ui| {
-                ui.label(RichText::new(truncate(raw, 20_000)).monospace().small());
+                ui.label(RichText::new(raw).monospace().small());
             });
         }
     }
@@ -1481,7 +1680,96 @@ fn block(ui: &mut egui::Ui, who: &str, color: Color32, stamp: &str, sidechain: b
             ui.label(RichText::new("subagent").small().weak());
         }
     });
-    // Very long turns are clipped; the CLI has the untruncated text.
-    ui.label(truncate(text, 12_000));
+    // Already capped by `cap_for_preview`; the CLI has the untruncated text.
+    ui.label(text);
     ui.add_space(2.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// What `reg query … /v AppliedDPI` actually prints, with `value` as the data.
+    fn reg_output(value: &str) -> String {
+        format!(
+            "\r\nHKEY_CURRENT_USER\\Control Panel\\Desktop\\WindowMetrics\r\n    \
+             AppliedDPI    REG_DWORD    {value}\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn applied_dpi_becomes_a_zoom_factor() {
+        assert_eq!(parse_applied_dpi(&reg_output("0x78")), Some(1.25));
+    }
+
+    #[test]
+    fn the_default_dpi_asks_for_no_zoom() {
+        assert_eq!(parse_applied_dpi(&reg_output("0x60")), None);
+        // A stale 0 would otherwise shrink the UI to nothing.
+        assert_eq!(parse_applied_dpi(&reg_output("0x0")), None);
+    }
+
+    #[test]
+    fn unparseable_dpi_is_none() {
+        assert_eq!(parse_applied_dpi(&reg_output("nonsense")), None);
+        assert_eq!(parse_applied_dpi(&reg_output("120")), None);
+    }
+
+    #[test]
+    fn missing_dpi_line_is_none() {
+        assert_eq!(parse_applied_dpi(""), None);
+        assert_eq!(
+            parse_applied_dpi("ERROR: The system was unable to find the specified registry key"),
+            None
+        );
+    }
+
+    fn meta(id: &str, size_bytes: u64) -> SessionMeta {
+        SessionMeta {
+            id: id.into(),
+            path: PathBuf::new(),
+            project_slug: "p".into(),
+            size_bytes,
+            modified_ms: 0,
+            first_ts: None,
+            last_ts: None,
+            title: String::new(),
+            cwd: None,
+            git_branch: None,
+            user_msgs: 0,
+            assistant_msgs: 0,
+            tool_calls: 0,
+        }
+    }
+
+    fn index() -> Index {
+        Index {
+            sessions: vec![meta("aaa", 10), meta("bbb", 200), meta("ccc", 3000)],
+            warnings: Vec::new(),
+        }
+    }
+
+    /// The action bar's count comes from `selection_summary`, the delete from
+    /// `marked_or`; the two disagreeing is a dialog that deletes the wrong set.
+    #[test]
+    fn selection_summary_agrees_with_marked_or() {
+        let ix = index();
+        let none = HashSet::new();
+
+        let empty = selection_summary(&ix, &none, None);
+        assert_eq!(empty, (0, 0));
+        assert_eq!(empty.0, ix.marked_or(&none, None).len());
+
+        let focused = &ix.sessions[1];
+        let one = selection_summary(&ix, &none, Some(focused));
+        assert_eq!(one, (1, 200));
+        assert_eq!(one.0, ix.marked_or(&none, Some(focused)).len());
+
+        let marked: HashSet<String> = ["aaa".to_string(), "ccc".to_string()].into();
+        // The focus is ignored once anything is marked, in both.
+        let two = selection_summary(&ix, &marked, Some(focused));
+        assert_eq!(two, (2, 3010));
+        assert_eq!(two.0, ix.marked_or(&marked, Some(focused)).len());
+    }
 }
