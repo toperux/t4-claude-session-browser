@@ -1,6 +1,6 @@
 [package]
 name = "claude-session-browser"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 # self_update 1.0.0-rc.6 declares 1.88 (let-chains), so that is the real floor.
 # CI builds on stable and nothing enforces this field; it is documentation, so
