@@ -10,9 +10,9 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 
 | ID | Sev | Area | Finding | Conf | Decision |
 |---|---|---|---|---|---|
-| D1 | P1 | delete | `...` session id resolves to the parent dir on Windows → plan trashes the whole project dir, `session-env/`, `file-history/` | high | fix: allowlist `[A-Za-z0-9._-]+`, not all dots, no trailing `.`/space; non-matching stems silently skipped in `discover`; tests for `...`, `....`, `abc.`, `abc `, `a:b` |
-| U1 | P2 | update | Self-update archive is never integrity-checked (`checksums` feature off) | high | fix: add `"checksums"` feature. Signatures deferred. |
-| M1 | P3 | build | `rust-version = "1.82"` is stale: self_update rc.6 declares 1.88 (let-chains), sha2 0.11 needs 1.85 | high | fix: bump to 1.88, fix the comment |
+| D1 | P1 | delete | `...` session id resolves to the parent dir on Windows → plan trashes the whole project dir, `session-env/`, `file-history/` | high | ✅ fix: allowlist `[A-Za-z0-9._-]+`, not all dots, no trailing `.`/space; non-matching stems silently skipped in `discover`; tests for `...`, `....`, `abc.`, `abc `, `a:b` |
+| U1 | P2 | update | Self-update archive is never integrity-checked (`checksums` feature off) | high | ✅ fix: add `"checksums"` feature. Signatures deferred. |
+| M1 | P3 | build | `rust-version = "1.82"` is stale: self_update rc.6 declares 1.88 (let-chains), sha2 0.11 needs 1.85 | high | ✅ fix: bump to 1.88, fix the comment |
 | C1 | P2 | cli | `csb list` / `csb show` panic on closed stdout pipe | high | fix: one `BufWriter<StdoutLock>` + `writeln!` for list/show/delete plan output; map `BrokenPipe` → `Ok(())` in `main` (walk `err.chain()`, the io error is wrapped in context) |
 | G1 | P2 | gui | "no sessions match" label is laid out below the clip rect, never visible | high | fix: `if visible.is_empty()` render label else scroll area; one message |
 | G2 | P2 | gui | Preview collapse state is keyed by widget position, bleeds across sessions and find-filter | medium | fix: salt with `(session id, original entry index)`; per-session state persists on return |

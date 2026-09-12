@@ -75,10 +75,19 @@ fn canon(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// A file stem that can safely be joined onto a directory as one component.
-/// Ids come from file names, not validated UUIDs, so this is the only thing
-/// standing between a stray `..jsonl` and a delete plan for a whole directory.
+/// An allowlist, not a blocklist: Win32 strips trailing dots from a path
+/// component, so `...` resolves to the directory itself and a `contains`-style
+/// check for separators lets it through. Ids are UUIDs in practice, and
+/// anything outside `[A-Za-z0-9._-]` is not csb's to delete. All-dots and a
+/// trailing `.` are rejected on top of the charset (a trailing space is
+/// already outside it).
 pub fn is_session_id(id: &str) -> bool {
-    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && !id.chars().all(|c| c == '.')
+        && !id.ends_with('.')
 }
 
 /// Running inside Windows Subsystem for Linux. Three signals, any of which is
@@ -165,8 +174,22 @@ mod tests {
         std::fs::create_dir_all(root.join("projects").join("slug")).unwrap();
         let dir = ClaudeDir::resolve(Some(&root)).unwrap();
 
-        for id in [".", "..", "", "a/b", "a\\b"] {
+        for id in [
+            ".", "..", "...", "....", "abc.", "abc ", "a:b", "a b", "é", "", "a/b", "a\\b",
+        ] {
             assert!(dir.session_paths("slug", id).is_empty(), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn is_session_id_accepts_real_ids() {
+        for id in [
+            "0241ed3f-1b2c-4d5e-8f9a-0b1c2d3e4f5a",
+            "agent-abc123",
+            "a.b",
+            ".hidden",
+        ] {
+            assert!(is_session_id(id), "{id:?}");
         }
     }
 

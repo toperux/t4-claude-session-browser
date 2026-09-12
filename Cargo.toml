@@ -2,9 +2,10 @@
 name = "claude-session-browser"
 version = "0.2.9"
 edition = "2021"
-# `Option::is_none_or`; without this an older toolchain fails with an opaque
-# "method not found" instead of a version message.
-rust-version = "1.82"
+# self_update 1.0.0-rc.6 declares 1.88 (let-chains), so that is the real floor.
+# CI builds on stable and nothing enforces this field; it is documentation, so
+# `cargo` gives a version message instead of a resolver error.
+rust-version = "1.88"
 description = "Browse, preview and delete Claude Code sessions - GUI, TUI and CLI in one binary"
 license = "MIT"
 repository = "https://github.com/toperux/t4-claude-session-browser"
@@ -31,8 +32,11 @@ serde_json = "1"
 # ureq, not the default reqwest backend: this app has no async runtime and
 # should not grow tokio+hyper just to fetch a release manifest. rustls keeps
 # OpenSSL off the Linux build.
+# `checksums` verifies the download against GitHub's per-asset digest before the
+# swap; without it the archive is installed on TLS trust alone.
 self_update = { version = "1.0.0-rc.6", default-features = false, features = [
     "ureq",
+    "checksums",
     "rustls",
     "github",
     "progress-bar",
