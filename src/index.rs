@@ -695,6 +695,11 @@ struct Cache {
 
 impl Cache {
     fn file() -> Option<PathBuf> {
+        // Tests build indexes over tempdirs; every one of those would otherwise
+        // leave its entries in the developer's real cache file.
+        #[cfg(test)]
+        return None;
+        #[cfg(not(test))]
         Some(
             dirs::cache_dir()?
                 .join("claude-session-browser")

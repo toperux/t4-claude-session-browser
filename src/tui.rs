@@ -9,6 +9,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::del::{self, human_bytes, PlanSummary};
 use crate::index::{truncate, Index, Project, SessionMeta, Sort};
@@ -40,7 +41,13 @@ struct App {
     /// Rendered once per selection, not once per frame.
     preview: Vec<Line<'static>>,
     preview_truncated: bool,
-    preview_scroll: u16,
+    preview_scroll: usize,
+    /// Session `preview` was built for. Filter, sort and reload rebuild the
+    /// list without necessarily moving the highlight, and re-parsing a large
+    /// transcript per keystroke is what this remembers enough to skip.
+    preview_for: Option<String>,
+    #[cfg(test)]
+    preview_loads: usize,
     focus: Pane,
     mode: Mode,
     filter: String,
@@ -63,6 +70,9 @@ impl App {
             preview: Vec::new(),
             preview_truncated: false,
             preview_scroll: 0,
+            preview_for: None,
+            #[cfg(test)]
+            preview_loads: 0,
             focus: Pane::Sessions,
             mode: Mode::Browse,
             filter: String::new(),
@@ -77,8 +87,14 @@ impl App {
     }
 
     fn rebuild_projects(&mut self) {
+        let slug = self.selected_slug().map(str::to_owned);
         self.project_rows = self.index.projects();
-        self.project_sel = self.project_sel.min(self.project_rows.len());
+        // `projects()` orders by newest session, so a rebuild can put a
+        // different project on the row the cursor sits on. Re-resolve it from
+        // the slug; a project that is gone falls back to row 0, "all projects".
+        self.project_sel = slug
+            .and_then(|slug| self.project_rows.iter().position(|p| p.slug == slug))
+            .map_or(0, |i| i + 1);
     }
 
     fn selected_slug(&self) -> Option<&str> {
@@ -86,22 +102,59 @@ impl App {
         Some(&p.slug)
     }
 
+    /// Point the list at another project, always landing on its top row.
+    /// `refilter` would re-resolve the highlighted id instead, and on a project
+    /// change that id belongs to the list being left.
+    fn select_project(&mut self, sel: usize) {
+        self.project_sel = sel;
+        self.visible = self
+            .index
+            .filter(self.selected_slug(), &self.filter, self.sort);
+        self.session_sel = 0;
+        self.sync_preview();
+    }
+
     fn refilter(&mut self) {
+        // The sort key and the index both reorder the list, so the row number
+        // alone would silently re-point the cursor at another session. Keep the
+        // highlight on the same id; one the new list does not hold leaves the
+        // clamped row in place.
+        let id = self.current().map(|s| s.id.clone());
         self.visible = self
             .index
             .filter(self.selected_slug(), &self.filter, self.sort);
         self.session_sel = self.session_sel.min(self.visible.len().saturating_sub(1));
-        self.load_preview();
+        if let Some(i) = id.and_then(|id| self.visible.iter().position(|s| s.id == id)) {
+            self.session_sel = i;
+        }
+        self.sync_preview();
     }
 
     fn current(&self) -> Option<&SessionMeta> {
         self.visible.get(self.session_sel)
     }
 
+    /// Reload the preview only when the highlight moved to another session.
+    /// Filter typing, sorting and a drained run of `j` repeats all resolve back
+    /// to an id that is already rendered. `reload_index` clears `preview_for` to
+    /// force the re-read a growing live transcript needs.
+    fn sync_preview(&mut self) {
+        let id = self.current().map(|s| s.id.clone());
+        if id.is_some() && id == self.preview_for {
+            return;
+        }
+        self.load_preview();
+    }
+
     fn load_preview(&mut self) {
+        #[cfg(test)]
+        {
+            self.preview_loads += 1;
+        }
         self.preview.clear();
         self.preview_truncated = false;
         self.preview_scroll = 0;
+        self.preview_for = self.current().map(|s| s.id.clone());
         let Some(meta) = self.current().cloned() else {
             return;
         };
@@ -141,11 +194,11 @@ impl App {
         self.preview = lines;
     }
 
-    /// Highest scroll offset that still leaves a line on screen. Counting
-    /// logical lines under-estimates wrapped ones, which errs toward showing
-    /// too much rather than scrolling into an empty pane.
-    fn max_scroll(&self) -> u16 {
-        u16::try_from(self.preview.len().saturating_sub(1)).unwrap_or(u16::MAX)
+    /// Highest scroll offset that still leaves a line on screen. `preview` holds
+    /// one entry per source line, so the only remaining under-estimate is a
+    /// single source line long enough to wrap onto several rows.
+    fn max_scroll(&self) -> usize {
+        self.preview.len().saturating_sub(1)
     }
 
     fn reload_index(&mut self) -> Result<()> {
@@ -156,6 +209,9 @@ impl App {
         self.marked
             .retain(|id| self.index.sessions.iter().any(|s| &s.id == id));
         self.rebuild_projects();
+        // A live session's file has grown since it was rendered, so this is the
+        // one path that must re-read the transcript for the same id.
+        self.preview_for = None;
         self.refilter();
         Ok(())
     }
@@ -203,13 +259,29 @@ pub fn run(dir: ClaudeDir) -> Result<()> {
 fn event_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result<()> {
     while !app.quit {
         term.draw(|f| draw(f, app))?;
-        if let TermEvent::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                handle_key(app, key);
-            }
+        feed(app, event::read()?);
+        // A held j/k queues repeats faster than a transcript parses. Handle the
+        // whole burst, then load the preview once for wherever the cursor came
+        // to rest, instead of parsing every session it passed over.
+        // A `q` in the middle of the burst ends the session: the rest of the
+        // queued type-ahead is not for this program, and the preview for a
+        // cursor nobody will see is a transcript parse on the way out.
+        while !app.quit && event::poll(Duration::ZERO)? {
+            feed(app, event::read()?);
+        }
+        if !app.quit {
+            app.sync_preview();
         }
     }
     Ok(())
+}
+
+fn feed(app: &mut App, event: TermEvent) {
+    if let TermEvent::Key(key) = event {
+        if key.kind == KeyEventKind::Press {
+            handle_key(app, key);
+        }
+    }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -299,7 +371,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 }
                 if app.session_sel + 1 < app.visible.len() {
                     app.session_sel += 1;
-                    app.load_preview();
+                    app.sync_preview();
                 }
             }
         }
@@ -340,21 +412,21 @@ fn move_sel(app: &mut App, delta: i32) {
         Pane::Projects => {
             let next = step(app.project_sel, app.project_rows.len() + 1);
             if next != app.project_sel {
-                app.project_sel = next;
-                app.session_sel = 0;
-                app.refilter();
+                app.select_project(next);
             }
         }
-        Pane::Sessions => {
-            let next = step(app.session_sel, app.visible.len());
-            if next != app.session_sel {
-                app.session_sel = next;
-                app.load_preview();
-            }
-        }
+        // Moving the cursor does not load the preview; `event_loop` does that
+        // once the whole burst of queued repeats has been handled.
+        Pane::Sessions => app.session_sel = step(app.session_sel, app.visible.len()),
         Pane::Preview => {
-            let next = i64::from(app.preview_scroll) + i64::from(delta);
-            app.preview_scroll = next.clamp(0, i64::from(app.max_scroll())) as u16;
+            app.preview_scroll = if delta < 0 {
+                app.preview_scroll
+                    .saturating_sub(delta.unsigned_abs() as usize)
+            } else {
+                app.preview_scroll
+                    .saturating_add(delta as usize)
+                    .min(app.max_scroll())
+            };
         }
     }
 }
@@ -362,9 +434,7 @@ fn move_sel(app: &mut App, delta: i32) {
 fn jump(app: &mut App, top: bool) {
     match app.focus {
         Pane::Projects => {
-            app.project_sel = if top { 0 } else { app.project_rows.len() };
-            app.session_sel = 0;
-            app.refilter();
+            app.select_project(if top { 0 } else { app.project_rows.len() });
         }
         Pane::Sessions => {
             app.session_sel = if top {
@@ -372,7 +442,7 @@ fn jump(app: &mut App, top: bool) {
             } else {
                 app.visible.len().saturating_sub(1)
             };
-            app.load_preview();
+            app.sync_preview();
         }
         Pane::Preview => app.preview_scroll = if top { 0 } else { app.max_scroll() },
     }
@@ -382,10 +452,14 @@ fn jump(app: &mut App, top: bool) {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(f.area());
+    // Minimums, not percentages: at 80 columns a 33% sessions pane has 24 inner
+    // cells and cuts the metadata line off after the date. The sessions pane
+    // keeps enough room for a short date plus msgs and size; the preview takes
+    // what is left over.
     let cols = Layout::horizontal([
-        Constraint::Percentage(22),
-        Constraint::Percentage(33),
-        Constraint::Percentage(45),
+        Constraint::Length(22),
+        Constraint::Min(34),
+        Constraint::Min(30),
     ])
     .split(rows[0]);
 
@@ -395,7 +469,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, rows[1]);
 
     if let Mode::Confirm(plans) = &app.mode {
-        draw_confirm(f, plans);
+        draw_confirm(f, plans, &app.visible);
     }
 }
 
@@ -460,13 +534,20 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(mark, Style::default().fg(Color::Yellow)),
                 Span::raw(truncate(&s.title, width.saturating_sub(4))),
             ]);
+            // `ACTIVE?` leads: it is the one part of this line that must survive
+            // a narrow pane, and the year is what a narrow pane can spare.
+            let stamp = if width < 40 {
+                "%m-%d %H:%M"
+            } else {
+                "%Y-%m-%d %H:%M"
+            };
             let meta = Line::from(Span::styled(
                 format!(
-                    "    {}  {} msgs  {}{}",
-                    s.activity().with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+                    "{}{}  {} msgs  {}",
+                    if s.is_recent() { "  ACTIVE? " } else { "  " },
+                    s.activity().with_timezone(&Local).format(stamp),
                     s.user_msgs + s.assistant_msgs,
                     human_bytes(s.size_bytes),
-                    if s.is_recent() { "  ACTIVE?" } else { "" },
                 ),
                 Style::default().fg(Color::DarkGray),
             ));
@@ -506,8 +587,8 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
     app.preview_scroll = app.preview_scroll.min(app.max_scroll());
 
     // Only the lines that can appear are cloned; the rest stay cached. The
-    // slack covers logical lines that wrap onto several rows.
-    let start = app.preview_scroll as usize;
+    // slack covers source lines that wrap onto several rows.
+    let start = app.preview_scroll;
     let budget = usize::from(area.height).saturating_mul(3).max(16);
     let window: Vec<Line> = app
         .preview
@@ -525,36 +606,51 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// One `Line` per source line. ratatui treats a `\n` inside a `Line` as
+/// zero-width whitespace, so a whole message packed into one `Line` is one
+/// scroll step no matter how many rows it renders as - and `max_scroll` counts
+/// lines, so its tail would be unreachable.
+fn styled_lines(text: &str, style: Style) -> Vec<Line<'static>> {
+    text.split('\n')
+        .map(|l| Line::from(Span::styled(l.to_owned(), style)))
+        .collect()
+}
+
 fn entry_lines(entry: &Entry) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
+    let body = |header: Span<'static>, text: &str| {
+        let mut lines = vec![Line::from(header)];
+        lines.extend(styled_lines(text, Style::default()));
+        lines.push(Line::from(""));
+        lines
+    };
     match &entry.event {
-        Event::User(text) => vec![
-            Line::from(Span::styled(
+        Event::User(text) => body(
+            Span::styled(
                 "▌ user",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(text.clone()),
-            Line::from(""),
-        ],
-        Event::Assistant(text) => vec![
-            Line::from(Span::styled(
+            ),
+            text,
+        ),
+        Event::Assistant(text) => body(
+            Span::styled(
                 "▌ claude",
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(text.clone()),
-            Line::from(""),
-        ],
-        Event::Thinking(text) => vec![
-            Line::from(Span::styled(
-                format!("~ {}", truncate(text, 400)),
+            ),
+            text,
+        ),
+        Event::Thinking(text) => {
+            let mut lines = styled_lines(
+                &format!("~ {}", truncate(text, 400)),
                 Style::default().fg(Color::Magenta),
-            )),
-            Line::from(""),
-        ],
+            );
+            lines.push(Line::from(""));
+            lines
+        }
         Event::ToolUse { name, headline, .. } => vec![Line::from(vec![
             Span::styled(format!("▸ {name}: "), Style::default().fg(Color::Yellow)),
             Span::styled(headline.clone(), dim),
@@ -567,10 +663,7 @@ fn entry_lines(entry: &Entry) -> Vec<Line<'static>> {
             } else {
                 dim
             };
-            vec![Line::from(Span::styled(
-                format!("  ↳ {}", truncate(preview, 200)),
-                style,
-            ))]
+            styled_lines(&format!("  ↳ {}", truncate(preview, 200)), style)
         }
     }
 }
@@ -609,8 +702,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_confirm(f: &mut Frame, plans: &[del::DeletePlan]) {
+fn draw_confirm(f: &mut Frame, plans: &[del::DeletePlan], visible: &[SessionMeta]) {
     let PlanSummary { bytes, files, live } = del::summarize(plans);
+    let warn = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -623,10 +717,23 @@ fn draw_confirm(f: &mut Frame, plans: &[del::DeletePlan]) {
         )),
         Line::from(""),
     ];
+    // Marks are global, so a project or filter change leaves sessions marked
+    // that the list no longer shows. Say how many are being taken on trust.
+    let off_view = plans
+        .iter()
+        .filter(|p| !visible.iter().any(|s| s.id == p.id))
+        .count();
+    if off_view > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("{off_view} of these are outside the current view"),
+            warn,
+        )));
+        lines.push(Line::from(""));
+    }
     if live > 0 {
         lines.push(Line::from(Span::styled(
             format!("WARNING: {live} of these were active in the last 5 minutes"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            warn,
         )));
         lines.push(Line::from(""));
     }
@@ -667,5 +774,181 @@ fn centered(width: u16, height: u16, area: Rect) -> Rect {
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two projects of two sessions each, every session a different size and a
+    /// different age, so `s` and `r` really do reorder the lists under the
+    /// cursor. Date order is a1, a2, b1, b2; size and msgs order is the reverse.
+    fn tree() -> (tempfile::TempDir, ClaudeDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        // (slug, id, records, day) - more records is a bigger file.
+        let sessions = [
+            ("-src-alpha", "a1", 1, 4),
+            ("-src-alpha", "a2", 2, 3),
+            ("-src-beta", "b1", 3, 2),
+            ("-src-beta", "b2", 4, 1),
+        ];
+        for (slug, id, records, day) in sessions {
+            let dir = tmp.path().join("projects").join(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            let body: String = (0..records)
+                .map(|_| record(slug, id, &format!("2026-01-0{day}T00:00:00Z")))
+                .collect();
+            std::fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+        }
+        let dir = ClaudeDir::resolve(Some(tmp.path())).unwrap();
+        (tmp, dir)
+    }
+
+    fn record(slug: &str, id: &str, ts: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"{ts}","cwd":"/p/{slug}","message":{{"content":"hello {id}"}}}}
+"#
+        )
+    }
+
+    /// Make one session the newest in the tree, so `projects()` reorders.
+    fn touch_newest(tmp: &tempfile::TempDir, slug: &str, id: &str) {
+        let path = tmp
+            .path()
+            .join("projects")
+            .join(slug)
+            .join(format!("{id}.jsonl"));
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        body.push_str(&record(slug, id, "2026-02-01T00:00:00Z"));
+        std::fs::write(&path, body).unwrap();
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn sort_keeps_the_same_session_selected() {
+        let (_tmp, dir) = tree();
+        let mut app = App::new(dir).unwrap();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.current().unwrap().id, "a2");
+
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.current().unwrap().id, "a2");
+        // Size order is the reverse of date order, so the row moved and only
+        // re-resolving the id can have kept the highlight.
+        assert_eq!(app.session_sel, 2);
+
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.current().unwrap().id, "a2");
+    }
+
+    #[test]
+    fn project_switch_lands_on_the_top_session() {
+        let (_tmp, dir) = tree();
+        let mut app = App::new(dir).unwrap();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.current().unwrap().id, "a2");
+
+        app.focus = Pane::Projects;
+        // Row 1 is alpha, row 2 is beta.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_slug(), Some("-src-beta"));
+        assert_eq!(app.session_sel, 0);
+        assert_eq!(app.current().unwrap().id, "b1");
+
+        // Back to "all projects": beta's top session sits at row 2 of the full
+        // list, so re-resolving the id would move the cursor off the top.
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.project_sel, 0);
+        assert_eq!(app.session_sel, 0);
+        assert_eq!(app.current().unwrap().id, "a1");
+    }
+
+    #[test]
+    fn reload_keeps_the_same_project_selected() {
+        let (tmp, dir) = tree();
+        let mut app = App::new(dir).unwrap();
+        app.focus = Pane::Projects;
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_slug(), Some("-src-beta"));
+
+        touch_newest(&tmp, "-src-beta", "b1");
+        press(&mut app, KeyCode::Char('r'));
+
+        assert_eq!(app.selected_slug(), Some("-src-beta"));
+        // beta is now the newest project, so it moved to the first row.
+        assert_eq!(app.project_sel, 1);
+    }
+
+    #[test]
+    fn reload_falls_back_to_all_when_the_project_is_gone() {
+        let (tmp, dir) = tree();
+        let mut app = App::new(dir).unwrap();
+        app.focus = Pane::Projects;
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_slug(), Some("-src-beta"));
+
+        std::fs::remove_dir_all(tmp.path().join("projects").join("-src-beta")).unwrap();
+        press(&mut app, KeyCode::Char('r'));
+
+        assert_eq!(app.project_sel, 0);
+        assert_eq!(app.selected_slug(), None);
+    }
+
+    #[test]
+    fn filter_typing_does_not_reload_the_preview() {
+        let (_tmp, dir) = tree();
+        let mut app = App::new(dir).unwrap();
+        assert!(!app.preview.is_empty());
+        let loads = app.preview_loads;
+        let id = app.current().unwrap().id.clone();
+
+        press(&mut app, KeyCode::Char('/'));
+        // Every title matches, so the same session stays highlighted.
+        press(&mut app, KeyCode::Char('h'));
+
+        assert_eq!(app.current().unwrap().id, id);
+        assert_eq!(app.preview_loads, loads);
+    }
+
+    #[test]
+    fn confirm_returns_to_browse_on_any_key() {
+        let (_tmp, dir) = tree();
+        let mut app = App::new(dir).unwrap();
+        let path = app.current().unwrap().path.clone();
+
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.mode, Mode::Confirm(_)));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.status, "delete cancelled");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn entry_lines_splits_on_newlines() {
+        let entry = Entry {
+            ts: None,
+            sidechain: false,
+            event: Event::User("a\n\nb".into()),
+        };
+        let text: Vec<String> = entry_lines(&entry)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(text, ["▌ user", "a", "", "b", ""]);
     }
 }
