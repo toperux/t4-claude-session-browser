@@ -1732,7 +1732,6 @@ mod tests {
             project_slug: "p".into(),
             size_bytes,
             modified_ms: 0,
-            first_ts: None,
             last_ts: None,
             title: String::new(),
             cwd: None,

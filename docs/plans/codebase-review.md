@@ -25,9 +25,9 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 | T3 | P3 | tui | Transcript reload on every filter keystroke / selection move, delete + reindex synchronous | high | ✅ fix: skip `load_preview` when selected id unchanged on filter/sort paths only; `reload_index` (`r`, post-delete) always forces it; drain queued input before loading. Delete-on-worker **deferred** |
 | G4 | P3 | gui | Preview worker for a just-deleted session lands and clobbers the delete status | medium | ✅ fix: `pending = None` where the delete result is applied (post-G3 that is the worker-result handler) + drop results whose id ≠ `focused`; land with G3 |
 | G5 | P3 | gui | Preview pane re-truncates and re-lays out every entry every frame | high | ✅ fix: memoize filtered list on `(id, needle)`; truncate in the GUI preview worker after `load` returns, **not** in `transcript::load` (shared with `csb show`, which prints full text). Virtualization (`show_viewport`) **deferred** |
-| X1 | P3 | index | Four-prompt title budget consumed by records that clean to nothing → `(untitled …)` | medium | fix: clean inside `scan_file` before pushing; bump `CACHE_SCHEMA` |
-| X2 | P3 | transcript | `transcript::load` fully deserializes every line incl. ~54% bookkeeping | high | fix: `memmem` pre-check for user/assistant before `from_slice`, sharing index.rs's byte-pattern constant so both scanners agree |
-| X3 | P3 | transcript | Multi-MB tool results copied in full before 300-char truncation | high | fix: truncate (via existing char-safe helper) then `replace`; cap `headline_for` fallback |
+| X1 | P3 | index | Four-prompt title budget consumed by records that clean to nothing → `(untitled …)` | medium | ✅ fix: clean inside `scan_file` before pushing; bump `CACHE_SCHEMA` |
+| X2 | P3 | transcript | `transcript::load` fully deserializes every line incl. ~54% bookkeeping | high | ✅ fix: `memmem` pre-check for user/assistant before `from_slice`, sharing index.rs's byte-pattern constant so both scanners agree |
+| X3 | P3 | transcript | Multi-MB tool results copied in full before 300-char truncation | high | ✅ fix: truncate (via existing char-safe helper) then `replace`; cap `headline_for` fallback |
 | C2 | P3 | cli | Non-interactive stdin → `delete` prints `aborted`, exits 0 | high | ✅ fix: `bail!("aborted")`; on EOF say `no terminal; pass --yes` |
 | C3 | P3 | cli | Mid-loop delete failure aborts without saying what was already trashed | high | ✅ fix: stop at first failure, report `deleted N of M, then failed`; **folded into S1** |
 | T4 | P3 | tui | 80-col terminal clips size, msg count and `ACTIVE?` from session rows | high | ✅ fix: `Constraint::Min` on sessions/preview; move `ACTIVE?` to the front of the metadata line; drop indent + short timestamp under ~40 cols |
@@ -40,16 +40,16 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 | K7 | P3 | packaging | `$dir` interpolated into a sed replacement unescaped (`&`, `|`, `\`) | high | ✅ fix: `grep -v '^Exec='` + `printf` the Exec line |
 | K8 | P3 | packaging | No `StartupWMClass` / `app_id`, so the launcher icon never attaches to the window | medium | ✅ fix: `.with_app_id("csb")` on the eframe viewport |
 | S1 | P4 | simplify | Delete-execute loop, plan summary and Sort label duplicated GUI ↔ TUI, already drifted | high | ✅ fix: `del::execute_all`, `del::PlanSummary`, `Sort::next/label`; all three front ends call them; **land before C/D** |
-| S2 | P4 | simplify | `SessionMeta::first_ts` written and cached, never read | high | fix: delete field; schema bump shared with X1 |
-| S3 | P4 | perf | `Cache::get` allocates a String per lookup; `BufRead::split` allocates a Vec per line | high | fix: `.as_ref()`; `read_until` + reused buf, done with X2 |
+| S2 | P4 | simplify | `SessionMeta::first_ts` written and cached, never read | high | ✅ fix: delete field; schema bump shared with X1 |
+| S3 | P4 | perf | `Cache::get` allocates a String per lookup; `BufRead::split` allocates a Vec per line | high | ✅ fix: `.as_ref()`; `read_until` + reused buf, done with X2 |
 | S4 | P4 | perf | `Event::ToolUse.raw` unbounded and rendered whole in the GUI | medium | ✅ fix: cap at 20 000 like ToolResult, in the GUI preview worker (same place as G5), not in `blocks_of` |
-| U2 | P4 | update | Windows update downloads and extracts the same zip twice | high | won't: `ponytail:` comment naming the cost |
-| U3 | P4 | update | A failed check erases the previously-seen version for 24h | high | fix: overwrite `last_seen` only on success |
+| U2 | P4 | update | Windows update downloads and extracts the same zip twice | high | ✅ won't: `ponytail:` comment naming the cost |
+| U3 | P4 | update | A failed check erases the previously-seen version for 24h | high | ✅ fix: overwrite `last_seen` only on success |
 | K9 | P4 | packaging | `chmod 755 $tmp` for `_apt` but the .deb inherits umask | high | ✅ fix: `chmod 644` the .deb after download |
 | K10 | P4 | packaging | Desktop-entry block guards on `csb.desktop` then copies `csb.png` unconditionally | high | ✅ fix: extend guard to `csb.png` |
 | K11 | P4 | packaging | Version-resolution block duplicated verbatim in both install scripts | high | ✅ won't: cross-reference comment in each |
 | Q1 | P4 | tests | `cli::delete` target selection and `del::plan` untested | high | ✅ fix: pure `select()` fn + tempdir tests; with batch B |
-| Q2 | P4 | tests | `Cache` load/get/store/schema-reset/retain untested; `discover`, `find`, `filter` untested | high | fix: tempdir tests; with X1/S2 |
+| Q2 | P4 | tests | `Cache` load/get/store/schema-reset/retain untested; `discover`, `find`, `filter` untested | high | ✅ fix: tempdir tests; with X1/S2 |
 | Q3 | P4 | tests | gui: `selection_summary` ↔ `marked_or` agreement and `wsl_host_zoom` DPI parse untestable as written | high | ✅ fix: split `parse_applied_dpi`, test both |
 | Q4 | P4 | tests | tui: no tests for `handle_key` / mode machine / selection identity across sort+reload | high | ✅ fix: synthetic `KeyEvent` tests over tempdir index; with batch C |
 

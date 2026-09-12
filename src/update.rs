@@ -186,13 +186,16 @@ pub fn check_throttled() -> Result<Option<Available>> {
 pub fn check_now() -> Result<Option<Available>> {
     // The throttle advances on failure too: "once a day" means once a day,
     // not once per launch while offline.
+    let previous = CheckCache::load().last_seen;
     let found = check();
     CheckCache {
         last_check_secs: chrono::Utc::now().timestamp(),
-        last_seen: found
-            .as_ref()
-            .ok()
-            .and_then(|f| f.as_ref().map(|a| a.version.clone())),
+        // A failed check learned nothing, so it keeps what the last successful
+        // one saw; only a successful "nothing newer" clears it.
+        last_seen: match found.as_ref() {
+            Ok(available) => available.as_ref().map(|a| a.version.clone()),
+            Err(_) => previous,
+        },
     }
     .store();
     found

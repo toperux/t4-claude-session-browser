@@ -408,7 +408,6 @@ mod tests {
             project_slug: slug.into(),
             size_bytes: 0,
             modified_ms: 0,
-            first_ts: None,
             last_ts: Some(now() - idle),
             title: String::new(),
             cwd: None,

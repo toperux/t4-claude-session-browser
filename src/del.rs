@@ -180,7 +180,6 @@ mod tests {
             project_slug: "-src-proj".into(),
             size_bytes: 5,
             modified_ms: 0,
-            first_ts: None,
             last_ts: None,
             title: "t".into(),
             cwd: None,

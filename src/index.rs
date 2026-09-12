@@ -23,7 +23,6 @@ pub struct SessionMeta {
     pub project_slug: String,
     pub size_bytes: u64,
     pub modified_ms: i64,
-    pub first_ts: Option<DateTime<Utc>>,
     pub last_ts: Option<DateTime<Utc>>,
     pub title: String,
     pub cwd: Option<String>,
@@ -173,10 +172,13 @@ impl Index {
                 .then_with(|| a.path.cmp(&b.path))
         });
 
-        // Sessions are keyed by bare id everywhere downstream, so two project
-        // dirs holding the same stem (a stray `notes.jsonl` in each) would take
-        // both files down together on a delete. Keep the newest, which the sort
-        // above put first, and report the rest.
+        // Transcripts live at `projects/<slug>/<id>.jsonl`, so the files
+        // themselves are slug-scoped; what is shared by bare id is the sidecar
+        // state, `session-env/<id>` and `file-history/<id>`. Marks and focus in
+        // the GUI and TUI are keyed by bare id too, so two project dirs holding
+        // the same stem (a stray `notes.jsonl` in each) would be
+        // indistinguishable to them. Keep the newest, which the sort above put
+        // first, and report the rest.
         let mut kept: HashMap<String, PathBuf> = HashMap::new();
         sessions.retain(|s| match kept.get(&s.id) {
             Some(winner) => {
@@ -368,22 +370,33 @@ fn scan_file(slug: &str, path: &Path, size_bytes: u64, modified_ms: i64) -> Resu
     let mut custom_title: Option<String> = None;
     let mut agent_name: Option<String> = None;
     let mut prompts: Vec<String> = Vec::new();
-    let mut first_ts = None;
     let mut last_ts = None;
     let mut cwd = None;
     let mut git_branch = None;
     let mut probes_left = 5u8;
     let (mut user_msgs, mut assistant_msgs, mut tool_calls) = (0u32, 0u32, 0u32);
 
-    let reader = BufReader::with_capacity(256 * 1024, File::open(path)?);
-    for line in reader.split(b'\n') {
-        let line = line?;
+    let mut reader = BufReader::with_capacity(256 * 1024, File::open(path)?);
+    // One reused buffer rather than an owned Vec per line. The separators come
+    // with it: a CRLF file used to parse because `\r` is JSON whitespace, so
+    // strip it here to keep that working.
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
         if line.is_empty() {
             continue;
         }
 
         if let Some(ts) = string_field(&line, &f_ts).and_then(parse_ts) {
-            first_ts.get_or_insert(ts);
             last_ts = Some(ts);
         }
 
@@ -438,8 +451,17 @@ fn scan_file(slug: &str, path: &Path, size_bytes: u64, modified_ms: i64) -> Resu
             && !flag_is_true(&line, &f_side)
         {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) {
+                // Filter here, not only in `derive_title`: a reminder-only
+                // record cleans to nothing and would otherwise spend one of
+                // the four slots and bury the real prompt. The compact summary
+                // is kept raw: `derive_title` reads it to mark a resumed
+                // session, and one summary per session is a slot worth paying.
                 if let Some(text) = message_text(&v["message"]["content"]) {
-                    prompts.push(text);
+                    if text.trim_start().starts_with(CONTINUED) {
+                        prompts.push(text);
+                    } else if let Some(clean) = clean_prompt(&text) {
+                        prompts.push(clean);
+                    }
                 }
             }
         }
@@ -463,7 +485,6 @@ fn scan_file(slug: &str, path: &Path, size_bytes: u64, modified_ms: i64) -> Resu
         project_slug: slug.to_string(),
         size_bytes,
         modified_ms,
-        first_ts,
         last_ts,
         title,
         cwd,
@@ -482,7 +503,7 @@ fn scan_file(slug: &str, path: &Path, size_bytes: u64, modified_ms: i64) -> Resu
 /// *before* their own. It is also safe against text that merely looks like
 /// JSON, because a quote inside a JSON string is escaped as `\"`, so the byte
 /// sequence `"type"` can never occur inside a string value.
-fn for_each_type(line: &[u8], finder: &memmem::Finder, mut visit: impl FnMut(&str)) {
+pub(crate) fn for_each_type(line: &[u8], finder: &memmem::Finder, mut visit: impl FnMut(&str)) {
     let mut pos = 0;
     while let Some(off) = finder.find(&line[pos..]) {
         pos += off + finder.needle().len();
@@ -681,10 +702,11 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 // ---------------------------------------------------------------- cache
 
-/// Bump whenever what gets indexed changes. Without this a metadata fix would
-/// appear to do nothing: entries are keyed on size+mtime, which do not change
-/// when the *indexing* does, so stale values would be served indefinitely.
-const CACHE_SCHEMA: u32 = 1;
+/// Bump whenever what gets indexed changes - the stored fields or how any of
+/// them is derived. Without this a metadata fix would appear to do nothing:
+/// entries are keyed on size+mtime, which do not change when the *indexing*
+/// does, so stale values would be served indefinitely.
+const CACHE_SCHEMA: u32 = 2;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -708,7 +730,11 @@ impl Cache {
     }
 
     fn load() -> Self {
-        let Some(path) = Self::file() else {
+        Self::load_from(Self::file().as_deref())
+    }
+
+    fn load_from(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
             return Self::default();
         };
         let cache: Self = std::fs::read(path)
@@ -723,15 +749,19 @@ impl Cache {
     }
 
     fn get(&self, path: &Path, size: u64, modified_ms: i64) -> Option<SessionMeta> {
-        let hit = self.entries.get(&path.to_string_lossy().into_owned())?;
+        let hit = self.entries.get(path.to_string_lossy().as_ref())?;
         (hit.size_bytes == size && hit.modified_ms == modified_ms).then(|| hit.clone())
+    }
+
+    fn store(self, sessions: &[SessionMeta], projects: &Path) {
+        self.store_to(Self::file().as_deref(), sessions, projects)
     }
 
     /// Entries under `projects` are replaced wholesale, so deleted sessions
     /// fall out; entries from any other claude dir (`--claude-dir`) are kept,
     /// so switching between trees does not throw the other one's work away.
-    fn store(mut self, sessions: &[SessionMeta], projects: &Path) {
-        let Some(path) = Self::file() else { return };
+    fn store_to(mut self, path: Option<&Path>, sessions: &[SessionMeta], projects: &Path) {
+        let Some(path) = path else { return };
         self.entries.retain(|_, s| !s.path.starts_with(projects));
         self.entries.extend(
             sessions
@@ -804,7 +834,6 @@ mod tests {
             project_slug: slug.into(),
             size_bytes: bytes,
             modified_ms: 0,
-            first_ts: None,
             last_ts: None,
             title: String::new(),
             cwd: cwd.map(str::to_string),
@@ -847,7 +876,6 @@ mod tests {
             project_slug: "s".into(),
             size_bytes: 0,
             modified_ms: i64::MAX,
-            first_ts: None,
             last_ts: None,
             title: String::new(),
             cwd: None,
@@ -1013,5 +1041,173 @@ mod tests {
         assert!(flag_is_true(br#"{"isMeta" : true}"#, &finder));
         assert!(!flag_is_true(br#"{"isMeta":false}"#, &finder));
         assert!(!flag_is_true(br#"{"other":true}"#, &finder));
+    }
+
+    /// Only the id and the cache key fields (path, size, mtime) matter below.
+    fn sample_meta(id: &str, path: &Path, size: u64, modified_ms: i64) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            path: path.to_path_buf(),
+            project_slug: "slug".into(),
+            size_bytes: size,
+            modified_ms,
+            last_ts: None,
+            title: "title".into(),
+            cwd: None,
+            git_branch: None,
+            user_msgs: 0,
+            assistant_msgs: 0,
+            tool_calls: 0,
+        }
+    }
+
+    #[test]
+    fn cache_round_trips_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("index.json");
+        let projects = tmp.path().join("projects");
+        let session = projects.join("slug/abc.jsonl");
+
+        Cache::default().store_to(
+            Some(&file),
+            &[sample_meta("abc", &session, 42, 7)],
+            &projects,
+        );
+        let hit = Cache::load_from(Some(&file)).get(&session, 42, 7).unwrap();
+        assert_eq!(hit.id, "abc");
+    }
+
+    #[test]
+    fn cache_misses_on_size_or_mtime_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("index.json");
+        let projects = tmp.path().join("projects");
+        let session = projects.join("slug/abc.jsonl");
+
+        Cache::default().store_to(
+            Some(&file),
+            &[sample_meta("abc", &session, 42, 7)],
+            &projects,
+        );
+        let cache = Cache::load_from(Some(&file));
+        assert!(cache.get(&session, 43, 7).is_none(), "size change");
+        assert!(cache.get(&session, 42, 8).is_none(), "mtime change");
+    }
+
+    #[test]
+    fn cache_resets_on_schema_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("index.json");
+        let session = tmp.path().join("abc.jsonl");
+        let stale = serde_json::json!({
+            "schema": CACHE_SCHEMA - 1,
+            "entries": {
+                session.to_string_lossy(): sample_meta("abc", &session, 42, 7),
+            },
+        });
+        std::fs::write(&file, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        assert!(Cache::load_from(Some(&file)).entries.is_empty());
+    }
+
+    /// `--claude-dir` switches trees; the other tree's work must survive.
+    #[test]
+    fn cache_keeps_entries_from_other_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("index.json");
+        let projects_a = tmp.path().join("a/projects");
+        let projects_b = tmp.path().join("b/projects");
+        let in_a = projects_a.join("slug/one.jsonl");
+        let in_b = projects_b.join("slug/two.jsonl");
+
+        Cache::default().store_to(Some(&file), &[sample_meta("one", &in_a, 1, 1)], &projects_a);
+        Cache::load_from(Some(&file)).store_to(
+            Some(&file),
+            &[sample_meta("two", &in_b, 2, 2)],
+            &projects_b,
+        );
+
+        let both = Cache::load_from(Some(&file));
+        assert!(both.get(&in_a, 1, 1).is_some());
+        assert!(both.get(&in_b, 2, 2).is_some());
+
+        // An empty scan of tree a drops only a's entries.
+        both.store_to(Some(&file), &[], &projects_a);
+        let after = Cache::load_from(Some(&file));
+        assert!(after.get(&in_a, 1, 1).is_none());
+        assert!(after.get(&in_b, 2, 2).is_some());
+    }
+
+    #[test]
+    fn discover_indexes_only_top_level_session_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slug = tmp.path().join("projects").join("slug");
+        std::fs::create_dir_all(slug.join("11111111-2222-3333-4444-555555555555")).unwrap();
+        std::fs::create_dir_all(slug.join("memory")).unwrap();
+        let session = slug.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        std::fs::write(&session, b"").unwrap();
+        // Per-session subdirectory, agent memory, and a non-transcript file.
+        std::fs::write(
+            slug.join("11111111-2222-3333-4444-555555555555/sub.jsonl"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(slug.join("memory/notes.jsonl"), b"").unwrap();
+        std::fs::write(slug.join("notes.txt"), b"").unwrap();
+
+        let dir = ClaudeDir::resolve(Some(tmp.path())).unwrap();
+        let found = discover(&dir).unwrap().files;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "slug");
+        assert!(found[0].1.ends_with(session.file_name().unwrap()));
+    }
+
+    #[test]
+    fn find_rejects_an_empty_needle() {
+        let index = Index {
+            sessions: vec![sample_meta("abc123", Path::new("abc123.jsonl"), 0, 0)],
+            warnings: Vec::new(),
+        };
+        assert!(index.find("").is_err(), "every id starts with \"\"");
+        assert!(index.find("zzz").is_err());
+        assert_eq!(index.find("abc").unwrap().id, "abc123");
+    }
+
+    #[test]
+    fn find_reports_ambiguity() {
+        let index = Index {
+            sessions: vec![
+                sample_meta("abc1", Path::new("abc1.jsonl"), 0, 0),
+                sample_meta("abc2", Path::new("abc2.jsonl"), 0, 0),
+            ],
+            warnings: Vec::new(),
+        };
+        let err = index.find("abc").unwrap_err().to_string();
+        assert!(err.contains("matches 2 sessions"), "{err}");
+        assert_eq!(index.find("abc1").unwrap().id, "abc1");
+    }
+
+    /// The four-prompt budget must not be spent on records that carry no title.
+    #[test]
+    fn title_budget_skips_records_that_clean_to_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let summary =
+            format!(r#"{{"type":"user","message":{{"content":"{CONTINUED}. Summary below."}}}}"#);
+        let reminder =
+            r#"{"type":"user","message":{"content":"<system-reminder>noise</system-reminder>"}}"#;
+        let real = r#"{"type":"user","message":{"content":"fix the parser"}}"#;
+        std::fs::write(
+            &path,
+            format!("{summary}\n{reminder}\n{reminder}\n{reminder}\n{real}\n"),
+        )
+        .unwrap();
+
+        // The summary is kept (it marks the session as resumed); the three
+        // reminders are not, so the real prompt still fits in the budget.
+        assert_eq!(
+            scan_file("slug", &path, 1, 0).unwrap().title,
+            "(continued) fix the parser"
+        );
     }
 }

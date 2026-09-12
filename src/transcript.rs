@@ -1,11 +1,12 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use memchr::memmem;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use crate::index::truncate;
+use crate::index::{for_each_type, truncate};
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -65,12 +66,39 @@ pub struct Transcript {
 }
 
 pub fn load(path: &Path, opts: &LoadOpts) -> Result<Transcript> {
-    let reader = BufReader::with_capacity(256 * 1024, File::open(path)?);
+    let mut reader = BufReader::with_capacity(256 * 1024, File::open(path)?);
     let mut out = Transcript::default();
+    let f_type = memmem::Finder::new(br#""type""#);
 
-    for line in reader.split(b'\n') {
-        let line = line?;
+    // One reused buffer rather than an owned Vec per line. The separators come
+    // with it: a CRLF file used to parse because `\r` is JSON whitespace, so
+    // strip it here to keep that working.
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
         if line.is_empty() {
+            continue;
+        }
+        // Roughly half of a transcript is bookkeeping `events_from` drops
+        // anyway; keep those out of serde_json. A byte sweep over every `type`
+        // value in the line, through the same reader the index scanner uses, so
+        // whitespace around the colon is tolerated here as well. A false
+        // positive - a nested content-block type - just falls through to the
+        // full parse, as before.
+        let mut wanted = false;
+        for_each_type(&line, &f_type, |v| {
+            wanted |= matches!(v, "user" | "assistant")
+        });
+        if !wanted {
             continue;
         }
         let Ok(v) = serde_json::from_slice::<Value>(&line) else {
@@ -156,7 +184,10 @@ fn blocks_of(content: &Value, assistant: bool) -> Vec<Event> {
                 let body = result_text(&b["content"]);
                 out.push(Event::ToolResult {
                     is_error: b["is_error"].as_bool().unwrap_or(false),
-                    preview: truncate(&body.replace('\n', " ⏎ "), 300),
+                    // Cut to a bound first: `replace` over a multi-MB result
+                    // copies all of it to keep 300 chars. 600 leaves room for
+                    // the newline expansion.
+                    preview: truncate(&truncate(&body, 600).replace('\n', " ⏎ "), 300),
                     raw: body,
                 });
             }
@@ -194,10 +225,13 @@ fn headline_for(input: &Value) -> String {
         if let Some(s) = input[key].as_str() {
             let s = s.trim();
             if !s.is_empty() {
-                return truncate(&s.replace('\n', " ⏎ "), 160);
+                // Bounded before the expansion, as in `blocks_of` above.
+                return truncate(&truncate(s, 480).replace('\n', " ⏎ "), 160);
             }
         }
     }
+    // ponytail: serializes the whole input to keep 160 chars; a bounded
+    // serializer (a Write sink that stops at n bytes) would fix it.
     truncate(&input.to_string(), 160)
 }
 
@@ -296,6 +330,13 @@ mod tests {
         let t = load(f.path(), &LoadOpts::default()).unwrap();
         assert_eq!(t.entries.len(), 1, "caveat and command dropped");
         assert!(matches!(&t.entries[0].event, Event::User(s) if s == "the real prompt"));
+    }
+
+    #[test]
+    fn whitespace_around_colons_still_loads() {
+        let f = fixture(&[r#"{"type" : "user", "message" : {"content" : "spaced"}}"#]);
+        let t = load(f.path(), &LoadOpts::default()).unwrap();
+        assert!(matches!(&t.entries[0].event, Event::User(s) if s == "spaced"));
     }
 
     #[test]
