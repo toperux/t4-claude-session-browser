@@ -57,18 +57,21 @@ winresource = "0.1"
 opt-level = 2
 
 # Linux packages, built by cargo-deb / cargo-generate-rpm in the release
-# workflow. Both install the binary to /usr/bin plus a desktop entry and icon
-# so the GUI shows up in application menus. The listed runtime libraries are
-# what eframe's glow backend dlopens; the package tools only see DT_NEEDED, so
-# they cannot find those on their own. `$auto` keeps the detected ones (a
-# versioned libc6 in particular - the binary wants the builder's glibc).
+# workflow. Both install the binary to /usr/bin plus a desktop entry and icon.
+# The binary's DT_NEEDED is only libc/libm/libgcc_s, so `$auto` covers no GUI
+# library at all (it is kept for the versioned libc6) and this list is the whole
+# runtime contract. It was derived from the dlopen sites in the locked crates:
+# winit x11 opens Xlib/Xcursor/X11-xcb, x11rb opens libxcb (pulled in by
+# libx11-6), glutin opens EGL then GLX, wayland-sys opens wayland-client/egl/
+# cursor, xkbcommon-dl opens xkbcommon. A winit/glutin/eframe bump means
+# re-checking those loaders.
 [package.metadata.deb]
 name = "csb"
 maintainer = "Christopher Montevirgen"
 copyright = "2026, Christopher Montevirgen"
 section = "utils"
 priority = "optional"
-depends = "$auto, libgl1, libx11-6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0"
+depends = "$auto, libgl1, libx11-6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libxcursor1, libx11-xcb1, libegl1, libwayland-egl1, libwayland-cursor0"
 assets = [
     ["target/release/csb", "usr/bin/", "755"],
     ["installer/csb.desktop", "usr/share/applications/", "644"],
@@ -80,7 +83,7 @@ assets = [
 # rpm is Fedora-only until someone needs otherwise.
 [package.metadata.generate-rpm]
 name = "csb"
-requires = { mesa-libGL = "*", libX11 = "*", libxkbcommon = "*", libxkbcommon-x11 = "*", libwayland-client = "*" }
+requires = { mesa-libGL = "*", libX11 = "*", libxkbcommon = "*", libxkbcommon-x11 = "*", libwayland-client = "*", libXcursor = "*", libX11-xcb = "*", mesa-libEGL = "*", libwayland-egl = "*", libwayland-cursor = "*" }
 assets = [
     { source = "target/release/csb", dest = "/usr/bin/csb", mode = "755" },
     { source = "installer/csb.desktop", dest = "/usr/share/applications/csb.desktop", mode = "644" },

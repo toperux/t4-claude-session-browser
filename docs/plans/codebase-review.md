@@ -18,7 +18,7 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 | G2 | P2 | gui | Preview collapse state is keyed by widget position, bleeds across sessions and find-filter | medium | ✅ fix: salt with `(session id, original entry index)`; per-session state persists on return |
 | T1 | P2 | tui | Project/session selection is positional; reload/sort/delete silently re-points it | high | ✅ fix: capture slug + id before rebuild/refilter, re-find after; vanished project → All; keep index model, re-resolve around rebuilds. Interacts with T3: `reload_index` must force the preview reload |
 | T2 | P2 | tui | Preview scrolls by logical entry, so most of a long message is unreachable | high | ✅ fix: split messages on `\n` into one `Line` each; keep pre-slice scrolling; widen `preview_scroll` to `usize` |
-| K1 | P2 | packaging | .deb/.rpm depends omit dlopened libs (Xcursor, X11-xcb, EGL, wayland-egl, wayland-cursor) | high (verified) | fix: deb `+libxcursor1, libx11-xcb1, libegl1, libwayland-egl1, libwayland-cursor0`; rpm `+libXcursor, libX11-xcb, mesa-libEGL, libwayland-egl, libwayland-cursor`; comment names the crates; smoke = `debian:bookworm-slim`, `apt install ./csb.deb`, then `ldconfig -p` shows all five sonames (no display in a container, so not `csb gui`) |
+| K1 | P2 | packaging | .deb/.rpm depends omit dlopened libs (Xcursor, X11-xcb, EGL, wayland-egl, wayland-cursor) | high (verified) | ✅ fix: deb `+libxcursor1, libx11-xcb1, libegl1, libwayland-egl1, libwayland-cursor0`; rpm `+libXcursor, libX11-xcb, mesa-libEGL, libwayland-egl, libwayland-cursor`; comment names the crates; smoke = `debian:bookworm-slim`, `apt install ./csb.deb`, then `ldconfig -p` shows all five sonames (no display in a container, so not `csb gui`) |
 | I1 | P3 | delete | Sessions keyed by bare id: duplicate stems across projects delete both; empty needle matches all | medium | ✅ fix: `bail!` on empty needle in `find`; dedupe ids in `Index::build`: keep the one with newest activity (deterministic), others to warning summary |
 | I2 | P3 | delete | Non-UTF-8 project slug: delete reconstructs path from lossy slug (half-delete or undeletable); cache key collision; `--json` panics | high mech / low freq | ✅ fix: `discover` skips non-UTF-8 dirs + warning summary; `--json` emits `to_string_lossy`. `del::plan` via `meta.path` **dropped**: moot once discover skips |
 | G3 | P3 | gui | plan + trash + reindex run synchronously on the egui thread, no spinner | high | ✅ fix: worker thread + channel (same shape as `focus`/`spawn_install`); Delete-click opens the dialog immediately with a spinner and Confirm disabled until plans arrive; Confirm runs execute + reindex on the worker; action-bar buttons disabled while pending |
@@ -32,12 +32,12 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 | C3 | P3 | cli | Mid-loop delete failure aborts without saying what was already trashed | high | ✅ fix: stop at first failure, report `deleted N of M, then failed`; **folded into S1** |
 | T4 | P3 | tui | 80-col terminal clips size, msg count and `ACTIVE?` from session rows | high | ✅ fix: `Constraint::Min` on sessions/preview; move `ACTIVE?` to the front of the metadata line; drop indent + short timestamp under ~40 cols |
 | T5 | P3 | tui | Marks are global across project/filter changes; `d` deletes off-screen sessions | medium | ✅ fix: keep global marks; confirm dialog shows "N of these are outside the current view" in **both** TUI and GUI |
-| K2 | P3 | packaging | install.sh routes openSUSE into an rpm whose requires cannot resolve | medium | fix: drop the zypper branch, fall through to the tarball hint |
-| K3 | P3 | packaging | `CSB_VERSION` pin to an older release fails under apt/dnf | medium | fix: apt `--allow-downgrades`, dnf `--allow-downgrade` when `CSB_VERSION` is set. dnf4 lacks the flag and errors loudly; Fedora ≥41 is dnf5. Loud beats today's silent no-op |
-| K4 | P3 | packaging | curl-pipe scripts not wrapped in `main()`; truncated download runs the prefix | high | fix: `main() { … }; main "$@"` in both scripts |
-| K5 | P3 | packaging | install.sh builds a local path from `SHA256SUMS` contents, unsanitised | medium | fix: `case "$file" in */*\|.*\|"") exit 1` after the awk (leading dot closes `..`) |
-| K6 | P3 | packaging | `shasum --quiet` rejected by older macOS shasum | medium | fix: drop `--quiet` (note: `-s` is shasum-only, GNU has none) |
-| K7 | P3 | packaging | `$dir` interpolated into a sed replacement unescaped (`&`, `|`, `\`) | high | fix: `grep -v '^Exec='` + `printf` the Exec line |
+| K2 | P3 | packaging | install.sh routes openSUSE into an rpm whose requires cannot resolve | medium | ✅ fix: drop the zypper branch, fall through to the tarball hint |
+| K3 | P3 | packaging | `CSB_VERSION` pin to an older release fails under apt/dnf | medium | ✅ fix: apt `--allow-downgrades`, dnf `--allow-downgrade` when `CSB_VERSION` is set. dnf4 lacks the flag and errors loudly; Fedora ≥41 is dnf5. Loud beats today's silent no-op |
+| K4 | P3 | packaging | curl-pipe scripts not wrapped in `main()`; truncated download runs the prefix | high | ✅ fix: `main() { … }; main "$@"` in both scripts |
+| K5 | P3 | packaging | install.sh builds a local path from `SHA256SUMS` contents, unsanitised | medium | ✅ fix: `case "$file" in */*\|.*\|"") exit 1` after the awk (leading dot closes `..`) |
+| K6 | P3 | packaging | `shasum --quiet` rejected by older macOS shasum | medium | ✅ fix: drop `--quiet` (note: `-s` is shasum-only, GNU has none) |
+| K7 | P3 | packaging | `$dir` interpolated into a sed replacement unescaped (`&`, `|`, `\`) | high | ✅ fix: `grep -v '^Exec='` + `printf` the Exec line |
 | K8 | P3 | packaging | No `StartupWMClass` / `app_id`, so the launcher icon never attaches to the window | medium | ✅ fix: `.with_app_id("csb")` on the eframe viewport |
 | S1 | P4 | simplify | Delete-execute loop, plan summary and Sort label duplicated GUI ↔ TUI, already drifted | high | ✅ fix: `del::execute_all`, `del::PlanSummary`, `Sort::next/label`; all three front ends call them; **land before C/D** |
 | S2 | P4 | simplify | `SessionMeta::first_ts` written and cached, never read | high | fix: delete field; schema bump shared with X1 |
@@ -45,9 +45,9 @@ Severity: **P1** data loss / crash on plausible input / security · **P2** wrong
 | S4 | P4 | perf | `Event::ToolUse.raw` unbounded and rendered whole in the GUI | medium | ✅ fix: cap at 20 000 like ToolResult, in the GUI preview worker (same place as G5), not in `blocks_of` |
 | U2 | P4 | update | Windows update downloads and extracts the same zip twice | high | won't: `ponytail:` comment naming the cost |
 | U3 | P4 | update | A failed check erases the previously-seen version for 24h | high | fix: overwrite `last_seen` only on success |
-| K9 | P4 | packaging | `chmod 755 $tmp` for `_apt` but the .deb inherits umask | high | fix: `chmod 644` the .deb after download |
-| K10 | P4 | packaging | Desktop-entry block guards on `csb.desktop` then copies `csb.png` unconditionally | high | fix: extend guard to `csb.png` |
-| K11 | P4 | packaging | Version-resolution block duplicated verbatim in both install scripts | high | won't: cross-reference comment in each |
+| K9 | P4 | packaging | `chmod 755 $tmp` for `_apt` but the .deb inherits umask | high | ✅ fix: `chmod 644` the .deb after download |
+| K10 | P4 | packaging | Desktop-entry block guards on `csb.desktop` then copies `csb.png` unconditionally | high | ✅ fix: extend guard to `csb.png` |
+| K11 | P4 | packaging | Version-resolution block duplicated verbatim in both install scripts | high | ✅ won't: cross-reference comment in each |
 | Q1 | P4 | tests | `cli::delete` target selection and `del::plan` untested | high | ✅ fix: pure `select()` fn + tempdir tests; with batch B |
 | Q2 | P4 | tests | `Cache` load/get/store/schema-reset/retain untested; `discover`, `find`, `filter` untested | high | fix: tempdir tests; with X1/S2 |
 | Q3 | P4 | tests | gui: `selection_summary` ↔ `marked_or` agreement and `wsl_host_zoom` DPI parse untestable as written | high | ✅ fix: split `parse_applied_dpi`, test both |
