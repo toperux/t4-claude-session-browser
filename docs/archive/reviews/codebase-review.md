@@ -1,5 +1,11 @@
 # Codebase review — csb 0.2.9 (2026-09-12)
 
+> **Status (2026-09-13): every batch landed, released in 0.2.10 (`e0163d1`).** A `4ea73dd`,
+> S `824867b`, B `cad0ae6`, C `801274f`, D `b99eddf`, E `6fc45fb`, F `0ba949e`. The
+> post-batch review is `review-fixes.md`, fixed in `c158a61`. Deferred and accepted items
+> are tracked in `docs/backlog.md`; there is no record of the K1 container smoke having run
+> before 0.2.10.
+
 Full-repo review at commit 49f323d. Five parallel read-only passes (core index/transcript/paths, CLI + delete + update, GUI, TUI, packaging), each finding verified against the source with a concrete failure input; findings that could not be substantiated were dropped. Duplicates across passes are merged below. The "Ruled out" appendix lists what was checked and found fine, so it is not re-raised.
 
 Severity: **P1** data loss / crash on plausible input / security · **P2** wrong behaviour on plausible input · **P3** perf or robustness on edge input · **P4** simplification / test gap.

@@ -1,10 +1,24 @@
 # CI/CD alignment, round 2 — t4-claude-session-browser (csb)
 
+> **Status (2026-09-13): done; D10 since reversed.** Sections 1–4 landed as `b5e0093`,
+> `c5b16cd`, `aaeed82`, plus `e322fac` for this file. The runner checks in section 7 were
+> never done on a branch; the `v0.2.10` release run (34702181218) covers them: `checks`
+> ran on the tag alongside `build` (checks 15:25:24–15:26:56, builds 15:25:32–15:30:48),
+> `publish` ran after both, and CI on `main` is green. D10 was reversed on 2026-09-12 by
+> `49f323d`: `.github/dependabot.yml` is back (github-actions + cargo, weekly, one grouped
+> cargo PR) and `ci.yml` runs on `pull_request` again, so bumps are checked before they
+> land, which closes the hole D10 avoided by other means. Dependabot security updates
+> (`automated-security-fixes`) are **on** as of 2026-09-13, fine for the same reason.
+> Finding 4 is moot: section 1's `checks.yml` already carried `permissions: contents: read`
+> on the job and `b5e0093` shipped it that way; `9556c9f` later made `release.yml`
+> read-only at the workflow level with write granted to `publish` alone.
+> Still open: the `ubuntu-22.04` retirement, tracked in `docs/backlog.md`.
+
 ## Context
 
 This repo is one of three t4 projects (with `t4-markdown-viewer` and `t4-git-ui`) whose
 GitHub Actions workflows are kept to a single shared shape. Round 1 landed here in commits
-`02eb73c` and `6c3dd03`; `docs/plans/ci-alignment.md` is its record and stays as-is.
+`02eb73c` and `6c3dd03`; `ci-alignment.md` (beside this file) is its record and stays as-is.
 
 Round 1 worked, but each of the three repos was executed by someone who could not see the
 other two, and all three independently patched the same gap — Dependabot PRs arriving with no

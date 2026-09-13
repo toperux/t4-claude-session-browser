@@ -1,5 +1,9 @@
 # Review fixes — post-batch review of 9f502f7..47f9a91
 
+> **Status (2026-09-13): landed in `c158a61`, released in 0.2.10.** Batch G is the whole
+> plan. The R3 smoke and the accepted items (R6, R9, R10, R11) are tracked in
+> `docs/backlog.md`.
+
 Findings from the adversarial review of the seven review batches. Each row is
 one change; `Decision` is filled in as we go.
 

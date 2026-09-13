@@ -1,5 +1,14 @@
 # CI/CD alignment plan — t4-claude-session-browser (csb)
 
+> **Status (2026-09-13): done, superseded.** Sections 1–3 landed in `02eb73c`. Round 2
+> (`ci-alignment-round-2.md`) moved the matrix into `checks.yml` and dropped Dependabot;
+> `49f323d` (2026-09-12) then brought Dependabot and the `pull_request` trigger back. The
+> section 6 checklist was never run on a branch, but runs on `main` prove the same facts:
+> Format ran on `ubuntu-22.04` only and was skipped on the other two legs (CI run
+> 34702004186); `957e2cd` (SECURITY.md only) sat at the head of `main` on 2026-09-10 with
+> no CI run, so `paths-ignore` holds; Dependabot PR #2 shows the three `check / <os>` legs. Still open: the `ubuntu-22.04` retirement in section 4,
+> tracked in `docs/backlog.md`.
+
 ## Context
 
 This repo is one of three t4 projects whose GitHub Actions workflows are being aligned to a
