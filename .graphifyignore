@@ -1,0 +1,5 @@
+# graphify also honors .gitignore (target, dist, stage, graphify-out).
+# Finished plans: hundreds of stale file:line refs that collide with live code nodes.
+docs/archive/
+# Binary, nothing to extract.
+assets/
