@@ -195,7 +195,7 @@ jobs:
       # target/<triple>/release instead of target/release.
       - name: Install the Linux packaging tools
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           # Pinned to a major/minor: install.sh reads the package names off
           # SHA256SUMS, but the target-path substitution and revision suffix
